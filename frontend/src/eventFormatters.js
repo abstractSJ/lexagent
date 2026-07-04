@@ -8,6 +8,9 @@
 
 const EVENT_TITLES = {
   legal_step: '执行步骤',
+  legal_selfheal: '链路自修复',
+  legal_memory_recalled: '历史咨询记忆已唤起',
+  legal_turn_metrics: '本轮执行指标',
   legal_rag_query_started: '法条检索中',
   case_state_updated: '案件状态已更新',
   legal_missing_details_suggested: '可先补充的关键信息',
@@ -47,6 +50,29 @@ export function summarizeEvent(eventType, data = {}) {
   if (eventType === 'legal_step') {
     const status = data.status === 'start' ? '开始' : data.status || '进行中';
     return `${status}：${data.name || '未命名步骤'}`;
+  }
+  if (eventType === 'legal_selfheal') {
+    const stage = data.stage || '内部环节';
+    return data.action === 'retried'
+      ? `${stage}出现波动，已自动重试成功。`
+      : `${stage}暂时失败，已降级继续，本轮结论可能不完整。`;
+  }
+  if (eventType === 'legal_memory_recalled') {
+    const memories = Array.isArray(data.memories) ? data.memories : [];
+    const titles = memories
+      .map((item) => item?.title)
+      .filter(Boolean)
+      .slice(0, 3)
+      .join('、');
+    const count = data.count || memories.length;
+    return titles ? `结合 ${count} 条历史咨询：${titles}` : `结合 ${count} 条历史咨询记忆。`;
+  }
+  if (eventType === 'legal_turn_metrics') {
+    const usage = data.llm_usage || {};
+    const seconds = ((data.total_duration_ms || 0) / 1000).toFixed(1);
+    const base = `总耗时 ${seconds} 秒，LLM 调用 ${usage.calls || 0} 次、${usage.total_tokens || 0} tokens。`;
+    const selfhealCount = data.selfheal_count || 0;
+    return selfhealCount > 0 ? `${base}本轮自修复 ${selfhealCount} 次。` : base;
   }
   if (eventType === 'legal_rag_query_started') {
     return '正在检索本地法条，请稍候。';
@@ -114,11 +140,15 @@ export function colorForEvent(eventType) {
   if (eventType === 'error') {
     return 'error';
   }
+  if (eventType === 'legal_selfheal') {
+    return 'info';
+  }
   if (eventType === 'done' || eventType === 'message_done') {
     return 'success';
   }
   if (
     eventType === 'legal_rag_query_started' ||
+    eventType === 'legal_memory_recalled' ||
     eventType === 'legal_web_search_started' ||
     eventType === 'legal_web_search_done' ||
     eventType === 'legal_reference_materials' ||
@@ -144,11 +174,16 @@ export function toneForEvent(eventType) {
   if (eventType === 'error') {
     return { borderColor: '#fecdd3', backgroundColor: '#fff1f3', titleColor: '#b42318' };
   }
+  if (eventType === 'legal_selfheal') {
+    // 自修复用琥珀色区分于普通 info：提醒用户本轮有环节波动，但不是失败红色。
+    return { borderColor: '#fde68a', backgroundColor: '#fffbeb', titleColor: '#b45309' };
+  }
   if (eventType === 'done' || eventType === 'message_done') {
     return { borderColor: '#bbf7d0', backgroundColor: '#ecfdf3', titleColor: '#15803d' };
   }
   if (
     eventType === 'legal_rag_query_started' ||
+    eventType === 'legal_memory_recalled' ||
     eventType === 'legal_web_search_started' ||
     eventType === 'legal_web_search_done' ||
     eventType === 'legal_reference_materials' ||

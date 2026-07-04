@@ -180,6 +180,49 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual([1, 2, 3], [item["seq"] for item in lines])
         self.assertEqual(["session_created", "turn_committed", "turn_committed"], [item["type"] for item in lines])
 
+    def test_read_events_returns_events_in_order(self) -> None:
+        """
+        read_events 应按写入顺序返回全部事件，负载原样读回。
+        """
+
+        session_id = self.store.create_session()
+        self.store.append_event(
+            session_id,
+            "turn_committed",
+            {"turn_count": 1, "metrics": {"total_duration_ms": 1500}},
+            turn_id=1,
+        )
+        self.store.append_event(session_id, "turn_failed", {"error": "boom"})
+
+        events = self.store.read_events(session_id)
+
+        self.assertEqual(["session_created", "turn_committed", "turn_failed"], [item["type"] for item in events])
+        self.assertEqual(1500, events[1]["data"]["metrics"]["total_duration_ms"])
+
+    def test_read_events_skips_corrupted_lines(self) -> None:
+        """
+        events.jsonl 中间混入坏行时应跳过该行，其余事件正常返回。
+        """
+
+        session_id = self.store.create_session()
+        self.store.append_event(session_id, "turn_committed", {"turn_count": 1}, turn_id=1)
+        events_path = self.base_dir / session_id / "events.jsonl"
+        with open(events_path, "a", encoding="utf-8") as handle:
+            handle.write("{坏行不是 JSON\n")
+        self.store.append_event(session_id, "turn_failed", {"error": "boom"})
+
+        events = self.store.read_events(session_id)
+
+        self.assertEqual(["session_created", "turn_committed", "turn_failed"], [item["type"] for item in events])
+
+    def test_read_events_missing_session_raises(self) -> None:
+        """
+        读取不存在会话的事件应抛出统一存储错误。
+        """
+
+        with self.assertRaises(SessionStoreError):
+            self.store.read_events("sess_20260101_090000_aaaa")
+
     def test_atomic_write_leaves_no_tmp_file(self) -> None:
         """
         快照写入成功后不应残留 tmp 文件。

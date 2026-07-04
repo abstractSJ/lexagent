@@ -49,13 +49,24 @@ class FakeLLM:
     仅用于测试结构化子任务的假 LLM。
 
     它按顺序返回预设响应，并记录 messages 与 options，便于验证内部 prompt 不会进入公开 history。
+    响应条目可以是 Exception 实例：轮到该条目时抛出，用于模拟网络/接口传输失败。
     """
 
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(self, responses: list, *, usage_per_call: dict | None = None) -> None:
         self.responses = list(responses)
         self.calls = 0
         self.seen_messages: list[list[dict[str, str]]] = []
         self.seen_options: list[LLMCallOptions | None] = []
+        # 模拟真实客户端的 usage 累计接口，供轮级 metrics 测试读取调用次数和 token 消耗。
+        self.usage_per_call = dict(usage_per_call or {})
+        self.usage_totals = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+    def snapshot_usage_totals(self) -> dict[str, int]:
+        """
+        返回累计 usage 快照，与 OpenAIChatClient 的可观测性接口保持一致。
+        """
+
+        return dict(self.usage_totals)
 
     def complete(
         self,
@@ -69,20 +80,32 @@ class FakeLLM:
         self.seen_options.append(options)
         response = self.responses[self.calls]
         self.calls += 1
+        if isinstance(response, Exception):
+            raise response
+        self.usage_totals["calls"] += 1
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            self.usage_totals[key] += int(self.usage_per_call.get(key) or 0)
         return response
 
 
 class FakePlanner:
     """
     仅用于测试 RAG 子任务的假 query planner。
+
+    Args:
+        plan: 预设返回的检索计划。
+        error: 可选异常；传入后 plan() 抛出，用于验证规划失败时的链路降级。
     """
 
-    def __init__(self, plan: LegalQueryPlan) -> None:
+    def __init__(self, plan: LegalQueryPlan, *, error: Exception | None = None) -> None:
         self.plan_result = plan
+        self.error = error
         self.seen_case_texts: list[str] = []
 
     def plan(self, case_text: str) -> LegalQueryPlan:
         self.seen_case_texts.append(case_text)
+        if self.error is not None:
+            raise self.error
         return self.plan_result
 
 
@@ -168,10 +191,14 @@ class FakeRunner:
         error: Exception | None = None,
         answer_text: str | None = None,
         stream_chunk_size: int = 7,
+        fail_times: int = 0,
     ) -> None:
         self.error = error
         self.answer_text = answer_text or "这是阶段性答复。以下内容仅作一般信息参考，不构成正式法律意见。"
         self.stream_chunk_size = max(1, int(stream_chunk_size))
+        # fail_times 表示“前 N 次调用失败、之后成功”，用于验证最终回答的自动重试；
+        # error 则表示每次调用都失败，用于验证重试耗尽后的回滚。
+        self.fail_times = int(fail_times)
         self.seen_calls: list[dict[str, object]] = []
 
     def run(self, messages, *, options=None, on_delta=None):
@@ -184,6 +211,9 @@ class FakeRunner:
         )
         if self.error is not None:
             raise self.error
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("模拟最终回答暂时失败")
         if on_delta is not None:
             for start in range(0, len(self.answer_text), self.stream_chunk_size):
                 on_delta(self.answer_text[start : start + self.stream_chunk_size])
@@ -1019,6 +1049,154 @@ class LegalConsultationFactoryTests(unittest.TestCase):
         self.assertEqual(["search_legal_articles", "web_search"], [tool["name"] for tool in session.web_search_subtask.tool_runner.to_openai_tools()])
 
 
+def build_valid_state_update_response() -> str:
+    """
+    构造状态更新子任务的合法 JSON 响应。
+    """
+
+    return json.dumps(
+        {
+            "state": {
+                "summary": "用户存在劳动争议。",
+                "parties": ["劳动者", "公司"],
+                "timeline": ["工作两年"],
+                "confirmed_facts": ["公司未签书面劳动合同"],
+                "disputed_facts": [],
+                "adverse_facts": [],
+                "contradictions": [],
+                "evidence_gaps": ["工资流水"],
+                "user_goals": ["要求补偿"],
+                "legal_concepts": ["可能涉及二倍工资"],
+                "follow_up_questions": ["是否有工资流水？"],
+            },
+            "newly_added_facts": ["公司未签书面劳动合同"],
+            "changed_facts": [],
+            "warnings": [],
+        },
+        ensure_ascii=False,
+    )
+
+
+def build_valid_case_analysis_response() -> str:
+    """
+    构造综合分析子任务的合法 JSON 响应。
+    """
+
+    return json.dumps(
+        {
+            "risks": [
+                {
+                    "type": "missing_evidence",
+                    "severity": "medium",
+                    "fact": "缺少工资流水",
+                    "reason": "会影响劳动关系和工资标准证明",
+                    "suggestion": "补充银行流水或工资条",
+                }
+            ],
+            "catalog": {
+                "case_points": ["未签书面劳动合同"],
+                "legal_concepts": ["可能涉及二倍工资"],
+                "follow_up_questions": ["入职时间是什么？"],
+            },
+            "next_action": {
+                "action": "ask_followup",
+                "reasons": ["还缺少工资和入职时间"],
+                "questions_to_ask": ["你什么时候入职？"],
+                "should_correct_previous_answer": False,
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+class SubtaskSelfHealTests(unittest.TestCase):
+    """
+    测试结构化子任务内部的自修复：JSON 解析失败的修复重试和传输失败的自动重试。
+    """
+
+    def build_empty_rag(self) -> LegalCaseRagResult:
+        """
+        构造空 RAG 结果，供综合分析器测试使用。
+        """
+
+        return LegalCaseRagResult(
+            query_plan=LegalQueryPlan(global_queries=[], issues=[], warnings=[]),
+            issue_results=[],
+            evidences=[],
+        )
+
+    def test_state_updater_repairs_invalid_json(self) -> None:
+        """
+        首次输出不是合法 JSON 时，应带着原始输出和错误信息发起修复重试并成功。
+        """
+
+        llm = FakeLLM(["这不是JSON输出", build_valid_state_update_response()])
+        updater = LegalCaseStateUpdater(llm)
+
+        update = updater.update(previous_state=LegalCaseState(), public_messages=[], user_input="公司没签合同")
+
+        self.assertEqual(1, update.state.version)
+        self.assertEqual("用户存在劳动争议。", update.state.summary)
+        self.assertEqual(2, llm.calls)
+        self.assertTrue(any("修复" in warning for warning in update.warnings))
+        # 修复 prompt 必须携带上一次的原始输出，模型才知道要改什么。
+        repair_prompt = llm.seen_messages[1][-1]["content"]
+        self.assertIn("这不是JSON输出", repair_prompt)
+
+    def test_state_updater_retries_transport_error(self) -> None:
+        """
+        LLM 调用本身抛异常（网络/接口失败）时应自动重试一次并成功。
+        """
+
+        llm = FakeLLM([RuntimeError("网络中断"), build_valid_state_update_response()])
+        updater = LegalCaseStateUpdater(llm)
+
+        update = updater.update(previous_state=LegalCaseState(), public_messages=[], user_input="公司没签合同")
+
+        self.assertEqual(1, update.state.version)
+        self.assertEqual(2, llm.calls)
+        self.assertTrue(any("重试" in warning for warning in update.warnings))
+
+    def test_state_updater_raises_after_repair_exhausted(self) -> None:
+        """
+        修复重试仍失败时向上抛出，由会话层决定降级策略。
+        """
+
+        llm = FakeLLM(["坏输出一", "坏输出二"])
+        updater = LegalCaseStateUpdater(llm)
+
+        with self.assertRaises(ValueError):
+            updater.update(previous_state=LegalCaseState(), public_messages=[], user_input="公司没签合同")
+        self.assertEqual(2, llm.calls)
+
+    def test_state_updater_raises_after_transport_retry_exhausted(self) -> None:
+        """
+        传输失败重试后再次失败时向上抛出原始异常。
+        """
+
+        llm = FakeLLM([RuntimeError("挂了一次"), RuntimeError("又挂了")])
+        updater = LegalCaseStateUpdater(llm)
+
+        with self.assertRaises(RuntimeError):
+            updater.update(previous_state=LegalCaseState(), public_messages=[], user_input="公司没签合同")
+        self.assertEqual(2, llm.calls)
+
+    def test_case_analyzer_repairs_invalid_json_and_records_warning(self) -> None:
+        """
+        综合分析器同样具备修复重试能力，修复过程记录在 analysis.warnings 里。
+        """
+
+        llm = FakeLLM(["不是JSON", build_valid_case_analysis_response()])
+        analyzer = LegalCaseAnalyzer(llm)
+
+        analysis = analyzer.analyze(state=LegalCaseState(), rag=self.build_empty_rag())
+
+        self.assertEqual("ask_followup", analysis.next_action.action)
+        self.assertEqual(1, len(analysis.risks))
+        self.assertEqual(2, llm.calls)
+        self.assertTrue(any("修复" in warning for warning in analysis.warnings))
+
+
 class LegalConsultationSessionTests(unittest.TestCase):
     """
     测试法律咨询业务会话的执行链路、公开历史和失败回滚。
@@ -1030,62 +1208,29 @@ class LegalConsultationSessionTests(unittest.TestCase):
         runner_error: Exception | None = None,
         web_search_error: Exception | None = None,
         runner_answer_text: str | None = None,
+        llm_responses: list | None = None,
+        planner_error: Exception | None = None,
+        runner_fail_times: int = 0,
+        llm_usage_per_call: dict | None = None,
     ) -> tuple[LegalConsultationSession, FakeRunner, FakeWebSearchSubtask]:
         """
         创建一套完整 fake session。
+
+        Args:
+            llm_responses: 可选自定义 LLM 响应脚本；为空时使用“状态更新 + 综合分析”各一次
+                成功响应的默认脚本。条目可以是 Exception，用于模拟传输失败。
+            planner_error: 可选 planner 异常，用于验证规划失败时的链路降级。
+            runner_fail_times: 最终回答前 N 次调用失败，用于验证自动重试。
+            llm_usage_per_call: FakeLLM 每次成功调用累计的 usage，用于轮级 metrics 测试。
         """
 
         # 一轮成功链路只有两次内部 LLM 调用：案件状态更新 + 综合分析。
         # FakeLLM 的预设响应数就是调用次数上限；如果链路退化成多次串行调用，这里会直接失败。
         llm = FakeLLM(
-            [
-                json.dumps(
-                    {
-                        "state": {
-                            "summary": "用户存在劳动争议。",
-                            "parties": ["劳动者", "公司"],
-                            "timeline": ["工作两年"],
-                            "confirmed_facts": ["公司未签书面劳动合同"],
-                            "disputed_facts": [],
-                            "adverse_facts": [],
-                            "contradictions": [],
-                            "evidence_gaps": ["工资流水"],
-                            "user_goals": ["要求补偿"],
-                            "legal_concepts": ["可能涉及二倍工资"],
-                            "follow_up_questions": ["是否有工资流水？"],
-                        },
-                        "newly_added_facts": ["公司未签书面劳动合同"],
-                        "changed_facts": [],
-                        "warnings": [],
-                    },
-                    ensure_ascii=False,
-                ),
-                json.dumps(
-                    {
-                        "risks": [
-                            {
-                                "type": "missing_evidence",
-                                "severity": "medium",
-                                "fact": "缺少工资流水",
-                                "reason": "会影响劳动关系和工资标准证明",
-                                "suggestion": "补充银行流水或工资条",
-                            }
-                        ],
-                        "catalog": {
-                            "case_points": ["未签书面劳动合同"],
-                            "legal_concepts": ["可能涉及二倍工资"],
-                            "follow_up_questions": ["入职时间是什么？"],
-                        },
-                        "next_action": {
-                            "action": "ask_followup",
-                            "reasons": ["还缺少工资和入职时间"],
-                            "questions_to_ask": ["你什么时候入职？"],
-                            "should_correct_previous_answer": False,
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            ]
+            llm_responses
+            if llm_responses is not None
+            else [build_valid_state_update_response(), build_valid_case_analysis_response()],
+            usage_per_call=llm_usage_per_call,
         )
         plan = LegalQueryPlan(
             global_queries=["劳动争议"],
@@ -1101,17 +1246,239 @@ class LegalConsultationSessionTests(unittest.TestCase):
             ],
             warnings=[],
         )
-        runner = FakeRunner(error=runner_error, answer_text=runner_answer_text)
+        runner = FakeRunner(error=runner_error, answer_text=runner_answer_text, fail_times=runner_fail_times)
         web_search = FakeWebSearchSubtask(error=web_search_error)
         session = LegalConsultationSession(
             state_updater=LegalCaseStateUpdater(llm),
-            rag_subtask=LegalCaseRagSubtask(planner=FakePlanner(plan), retriever=FakeRetriever()),
+            rag_subtask=LegalCaseRagSubtask(planner=FakePlanner(plan, error=planner_error), retriever=FakeRetriever()),
             case_analyzer=LegalCaseAnalyzer(llm),
             web_search_subtask=web_search,
             answer_runner=runner,
             system_prompt="你是法律助手。",
         )
         return session, runner, web_search
+
+    def test_state_update_failure_degrades_and_chain_completes(self) -> None:
+        """
+        状态更新彻底失败时应降级为沿用既有案件状态，链路其余部分照常走完并正常提交。
+        """
+
+        session, runner, _ = self.build_session(
+            llm_responses=["坏输出一", "坏输出二", build_valid_case_analysis_response()],
+        )
+
+        answer, events = session.ask_with_events("公司没签合同怎么办？")
+
+        self.assertIn("阶段性答复", answer)
+        event_types = [event.type for event in events]
+        self.assertIn("legal_selfheal", event_types)
+        selfheal = next(event for event in events if event.type == "legal_selfheal")
+        self.assertEqual("degraded", selfheal.data["action"])
+        self.assertEqual("案件状态更新", selfheal.data["stage"])
+        # 链路走完：RAG、综合分析和最终回答事件齐全。
+        self.assertIn("legal_case_rag_done", event_types)
+        self.assertIn("legal_risk_analyzed", event_types)
+        self.assertIn("message_done", event_types)
+        self.assertEqual(1, len(runner.seen_calls))
+        self.assertEqual(["system", "user", "assistant"], [m["role"] for m in session.history()])
+
+    def test_rag_failure_degrades_and_chain_completes(self) -> None:
+        """
+        query 规划失败时应降级为空法条证据继续分析，不中断整轮咨询。
+        """
+
+        session, runner, _ = self.build_session(planner_error=RuntimeError("planner boom"))
+
+        answer, events = session.ask_with_events("公司没签合同怎么办？")
+
+        self.assertIn("阶段性答复", answer)
+        event_types = [event.type for event in events]
+        selfheal = next(event for event in events if event.type == "legal_selfheal")
+        self.assertEqual("degraded", selfheal.data["action"])
+        self.assertIn("RAG", selfheal.data["stage"])
+        rag_done = next(event for event in events if event.type == "legal_case_rag_done")
+        self.assertEqual(0, rag_done.data["evidence_count"])
+        self.assertTrue(rag_done.data["warnings"])
+        self.assertIn("message_done", event_types)
+        self.assertEqual(["system", "user", "assistant"], [m["role"] for m in session.history()])
+
+    def test_analyzer_failure_degrades_and_chain_completes(self) -> None:
+        """
+        综合分析彻底失败时应降级为空风险 + 默认追问动作，最终回答仍然生成。
+        """
+
+        session, runner, _ = self.build_session(
+            llm_responses=[build_valid_state_update_response(), "坏输出一", "坏输出二"],
+        )
+
+        answer, events = session.ask_with_events("公司没签合同怎么办？")
+
+        self.assertIn("阶段性答复", answer)
+        selfheal = next(event for event in events if event.type == "legal_selfheal")
+        self.assertEqual("degraded", selfheal.data["action"])
+        self.assertEqual("案情综合分析", selfheal.data["stage"])
+        risk_event = next(event for event in events if event.type == "legal_risk_analyzed")
+        self.assertEqual(0, risk_event.data["risk_count"])
+        action_event = next(event for event in events if event.type == "legal_next_action_decided")
+        self.assertEqual("ask_followup", action_event.data["action"])
+        self.assertEqual(["system", "user", "assistant"], [m["role"] for m in session.history()])
+
+    def test_final_answer_retries_once_without_streaming(self) -> None:
+        """
+        最终回答首次失败时应自动重试一次；重试改为非流式，避免与已推送的部分增量叠加。
+        """
+
+        session, runner, _ = self.build_session(runner_fail_times=1)
+        received: list[AgentEvent] = []
+
+        answer, events = session.ask_with_events("公司没签合同怎么办？", on_event=received.append)
+
+        self.assertIn("阶段性答复", answer)
+        selfheal = next(event for event in events if event.type == "legal_selfheal")
+        self.assertEqual("retried", selfheal.data["action"])
+        self.assertEqual("最终回答生成", selfheal.data["stage"])
+        self.assertEqual(2, len(runner.seen_calls))
+        self.assertTrue(runner.seen_calls[0]["streaming"])
+        self.assertFalse(runner.seen_calls[1]["streaming"])
+        self.assertEqual(["system", "user", "assistant"], [m["role"] for m in session.history()])
+
+    def test_turn_emits_metrics_event_with_stages_and_usage(self) -> None:
+        """
+        成功一轮应在末尾发出 legal_turn_metrics：分阶段耗时、状态和 LLM usage 增量。
+        """
+
+        session, _, _ = self.build_session(
+            llm_usage_per_call={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+        )
+
+        _, events = session.ask_with_events("公司没签合同怎么办？")
+
+        metrics = next(event for event in events if event.type == "legal_turn_metrics")
+        stages = {item["stage"]: item for item in metrics.data["stages"]}
+        for stage_name in ("案件状态更新", "案情拆解 + 多 query RAG", "案情综合分析", "最终回答生成"):
+            self.assertIn(stage_name, stages)
+            self.assertEqual("ok", stages[stage_name]["status"])
+        self.assertTrue(all(item["duration_ms"] >= 0 for item in metrics.data["stages"]))
+        self.assertGreaterEqual(metrics.data["total_duration_ms"], 0)
+        # 状态更新 + 综合分析走 FakeLLM，各累计一次调用；最终回答走 FakeRunner，不计入。
+        usage = metrics.data["llm_usage"]
+        self.assertEqual(2, usage["calls"])
+        self.assertEqual(240, usage["total_tokens"])
+        self.assertEqual(0, metrics.data["selfheal_count"])
+        # metrics 是本轮收尾事件，晚于最终回答完成。
+        event_types = [event.type for event in events]
+        self.assertGreater(event_types.index("legal_turn_metrics"), event_types.index("message_done"))
+
+    def test_metrics_marks_degraded_and_retried_stages(self) -> None:
+        """
+        降级和重试要反映在对应阶段的 status 上，并累计 selfheal_count。
+        """
+
+        session, _, _ = self.build_session(
+            planner_error=RuntimeError("planner boom"),
+            runner_fail_times=1,
+        )
+
+        _, events = session.ask_with_events("公司没签合同怎么办？")
+
+        metrics = next(event for event in events if event.type == "legal_turn_metrics")
+        stages = {item["stage"]: item for item in metrics.data["stages"]}
+        self.assertEqual("degraded", stages["案情拆解 + 多 query RAG"]["status"])
+        self.assertEqual("retried", stages["最终回答生成"]["status"])
+        self.assertEqual(2, metrics.data["selfheal_count"])
+
+    def test_pause_turn_emits_metrics_with_state_stage_only(self) -> None:
+        """
+        暂停补充轮只执行状态更新，metrics 应只包含该阶段。
+        """
+
+        pause_response = json.dumps(
+            {
+                "state": {"summary": "缺少关键信息", "follow_up_questions": ["何时入职？"]},
+                "should_pause_for_supplement": True,
+                "pause_reason": "缺少入职时间",
+                "supplement_questions": ["何时入职？"],
+            },
+            ensure_ascii=False,
+        )
+        session, _, _ = self.build_session(llm_responses=[pause_response])
+
+        _, events = session.ask_with_events("公司没签合同")
+
+        metrics = next(event for event in events if event.type == "legal_turn_metrics")
+        self.assertEqual(["案件状态更新"], [item["stage"] for item in metrics.data["stages"]])
+        self.assertEqual(1, metrics.data["llm_usage"]["calls"])
+
+    def test_recalled_memories_enter_prompts_and_emit_event(self) -> None:
+        """
+        传入历史记忆时应发 legal_memory_recalled 事件，并注入状态更新 prompt 和最终回答运行时输入；
+        公开 history 仍只保存用户原始输入，不携带记忆文本。
+        """
+
+        session, runner, _ = self.build_session()
+        memories = [
+            {
+                "title": "此前的劳动合同咨询",
+                "summary": "用户此前咨询过未签书面劳动合同问题。",
+                "key_facts": ["公司未签书面劳动合同"],
+                "user_goals": ["要求二倍工资"],
+                "legal_concepts": ["可能涉及二倍工资"],
+                "updated_at": "2026-07-01T00:00:00+00:00",
+            }
+        ]
+
+        _, events = session.ask_with_events("公司现在又拖欠工资怎么办？", recalled_memories=memories)
+
+        event_types = [event.type for event in events]
+        self.assertIn("legal_memory_recalled", event_types)
+        # 记忆唤起发生在链路最前面：先告诉用户“结合了哪些历史咨询”，再开始状态更新。
+        self.assertLess(event_types.index("legal_memory_recalled"), event_types.index("case_state_updated"))
+        memory_event = next(event for event in events if event.type == "legal_memory_recalled")
+        self.assertEqual(1, memory_event.data["count"])
+        self.assertEqual("此前的劳动合同咨询", memory_event.data["memories"][0]["title"])
+        # 事件面向前端展示，只应携带标题、摘要和更新时间三个白名单字段。
+        self.assertEqual({"title", "summary", "updated_at"}, set(memory_event.data["memories"][0].keys()))
+
+        updater_prompt = session.state_updater.llm.seen_messages[0][-1]["content"]
+        self.assertIn("【历史咨询记忆", updater_prompt)
+        self.assertIn("此前的劳动合同咨询", updater_prompt)
+        self.assertIn("不得把历史记忆内容写入", updater_prompt)
+
+        runtime_input = runner.seen_calls[0]["messages"][-1]["content"]
+        self.assertIn("【历史咨询记忆】", runtime_input)
+        self.assertIn("此前的劳动合同咨询", runtime_input)
+
+        history = session.history()
+        self.assertEqual("公司现在又拖欠工资怎么办？", history[-2]["content"])
+
+    def test_without_recalled_memories_prompts_stay_clean(self) -> None:
+        """
+        不传历史记忆时不发记忆事件，各 prompt 也不出现记忆区块，保持旧链路完全不变。
+        """
+
+        session, runner, _ = self.build_session()
+
+        _, events = session.ask_with_events("公司没签合同怎么办？")
+
+        self.assertNotIn("legal_memory_recalled", [event.type for event in events])
+        updater_prompt = session.state_updater.llm.seen_messages[0][-1]["content"]
+        self.assertNotIn("历史咨询记忆", updater_prompt)
+        runtime_input = runner.seen_calls[0]["messages"][-1]["content"]
+        self.assertNotIn("历史咨询记忆", runtime_input)
+
+    def test_blank_recalled_memories_are_ignored(self) -> None:
+        """
+        空白或非法记忆条目应被静默过滤：记忆是辅助信号，脏数据不能打断咨询链路。
+        """
+
+        session, _, _ = self.build_session()
+
+        _, events = session.ask_with_events(
+            "公司没签合同怎么办？",
+            recalled_memories=[{"title": " ", "summary": ""}, "junk", 42],
+        )
+
+        self.assertNotIn("legal_memory_recalled", [event.type for event in events])
 
     def test_full_turn_keeps_internal_subtasks_out_of_public_history(self) -> None:
         """

@@ -326,11 +326,13 @@ class LegalCaseAnalysis:
         risks: 不利事实、矛盾和证据缺口等风险项。
         catalog: 案情要点、法律概念和追问目录。
         next_action: 下一步动作判断。
+        warnings: 分析过程中的非致命提示，例如输出修复重试、调用重试记录。
     """
 
     risks: list[LegalRiskFinding] = field(default_factory=list)
     catalog: LegalAnalysisCatalog = field(default_factory=LegalAnalysisCatalog)
     next_action: LegalNextAction = field(default_factory=LegalNextAction)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

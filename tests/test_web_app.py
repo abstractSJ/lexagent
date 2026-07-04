@@ -18,6 +18,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from agent_system.agent.events import AgentEvent
+from agent_system.memory import MemoryStore
 from agent_system.storage import SessionStore
 from web_app.server import create_app, sanitize_event_for_web
 
@@ -609,11 +610,28 @@ class PersistableFakeSession(FakeLegalSession):
         super().__init__(**kwargs)
         self.public_messages: list[dict[str, str]] = [{"role": "system", "content": "系统提示"}]
         self.restored_snapshots: list[dict[str, object]] = []
+        # 记录每轮收到的历史记忆负载：None 表示后端本轮没有传该参数。
+        self.seen_recalled_memories: list[list[dict[str, object]] | None] = []
 
-    def ask_with_events(self, text, *, on_event=None):
+    def ask_with_events(self, text, *, on_event=None, recalled_memories=None):
+        self.seen_recalled_memories.append(recalled_memories)
         answer, events = super().ask_with_events(text, on_event=on_event)
         if not self.pause:
             events = list(events)
+            events.append(
+                AgentEvent(
+                    type="legal_turn_metrics",
+                    data={
+                        "stages": [
+                            {"stage": "案件状态更新", "duration_ms": 120, "status": "ok"},
+                            {"stage": "最终回答生成", "duration_ms": 800, "status": "ok"},
+                        ],
+                        "total_duration_ms": 1500,
+                        "llm_usage": {"calls": 4, "input_tokens": 900, "output_tokens": 300, "total_tokens": 1200},
+                        "selfheal_count": 0,
+                    },
+                )
+            )
             events.append(
                 AgentEvent(
                     type="legal_reference_materials",
@@ -645,7 +663,15 @@ class PersistableFakeSession(FakeLegalSession):
 
         return {
             "messages": [dict(message) for message in self.public_messages],
-            "case_state": {"summary": "fake 案件状态", "version": len(self.public_messages)},
+            # case_state 字段与真实 LegalCaseState 对齐，让记忆沉淀测试能验证关键词提取。
+            "case_state": {
+                "summary": "fake 案件状态",
+                "parties": ["劳动者", "公司"],
+                "confirmed_facts": ["公司未签书面劳动合同"],
+                "user_goals": ["主张二倍工资"],
+                "legal_concepts": ["可能涉及二倍工资", "可能涉及劳动合同解除"],
+                "version": len(self.public_messages),
+            },
         }
 
     def restore_snapshot(self, snapshot: dict[str, object]) -> None:
@@ -669,6 +695,7 @@ class MultiSessionWebAppTests(unittest.TestCase):
         os.environ["LEGAL_RAG_PRELOAD"] = "0"
         self._tmp = tempfile.TemporaryDirectory()
         self.store = SessionStore(Path(self._tmp.name) / "sessions")
+        self.memory_store = MemoryStore(Path(self._tmp.name) / "memory")
 
     def tearDown(self) -> None:
         if self.old_preload is None:
@@ -701,7 +728,7 @@ class MultiSessionWebAppTests(unittest.TestCase):
 
         if factory is None:
             factory, _ = self.make_factory()
-        return TestClient(create_app(session_factory=factory, store=self.store))
+        return TestClient(create_app(session_factory=factory, store=self.store, memory_store=self.memory_store))
 
     def parse_ndjson(self, text: str) -> list[dict[str, object]]:
         """
@@ -728,6 +755,200 @@ class MultiSessionWebAppTests(unittest.TestCase):
             if item.get("type") == item_type:
                 return item
         return None
+
+    def test_turn_commit_writes_case_memory(self) -> None:
+        """
+        一轮成功提交后应把案件知识沉淀为跨会话记忆：关键词已剥前缀，轮次与会话对齐。
+        """
+
+        client = self.build_client()
+        items = self.chat(client, {"message": "公司一直不签劳动合同，想主张二倍工资，该怎么办？"})
+        session_id = items[0]["session_id"]
+
+        memory = self.memory_store.load(session_id)
+        self.assertIsNotNone(memory)
+        self.assertIn("二倍工资", memory.keywords)
+        self.assertIn("劳动合同解除", memory.keywords)
+        self.assertEqual("fake 案件状态", memory.summary)
+        self.assertEqual(1, memory.turn_count)
+        self.assertTrue(memory.title)
+
+    def test_new_session_recalls_memories_from_other_sessions(self) -> None:
+        """
+        新会话咨询相近主题时，后端应检索历史记忆并把白名单负载传给会话实例。
+        """
+
+        factory, created = self.make_factory()
+        client = self.build_client(factory)
+
+        first_items = self.chat(client, {"message": "公司一直不签劳动合同，想主张二倍工资，该怎么办？"})
+        first_id = first_items[0]["session_id"]
+        second_items = self.chat(client, {"message": "二倍工资的仲裁时效是多久？"})
+        second_id = second_items[0]["session_id"]
+
+        self.assertNotEqual(first_id, second_id)
+        second_session = created[-1]
+        self.assertEqual(1, len(second_session.seen_recalled_memories))
+        payload = second_session.seen_recalled_memories[0]
+        self.assertTrue(payload)
+        self.assertEqual("公司一直不签劳动合同，想主张二倍工资，该怎么办？", payload[0]["title"])
+        self.assertIn("可能涉及二倍工资", payload[0]["legal_concepts"])
+        # 负载是白名单结构，不应携带 session_id、score 等内部字段。
+        self.assertNotIn("session_id", payload[0])
+
+    def test_same_session_does_not_recall_own_memory(self) -> None:
+        """
+        续聊同一会话时必须排除它自己的记忆：该会话知识已在 case_state 里，无需重复注入。
+        """
+
+        factory, created = self.make_factory()
+        client = self.build_client(factory)
+
+        items = self.chat(client, {"message": "公司一直不签劳动合同，想主张二倍工资，该怎么办？"})
+        session_id = items[0]["session_id"]
+        self.chat(client, {"session_id": session_id, "message": "关于二倍工资我再补充一点情况"})
+
+        target = created[0]
+        self.assertEqual(2, len(target.seen_recalled_memories))
+        self.assertIsNone(target.seen_recalled_memories[0])
+        self.assertIsNone(target.seen_recalled_memories[1])
+
+    def test_delete_session_also_removes_memory(self) -> None:
+        """
+        删除历史会话时其沉淀记忆必须一并删除，避免已删除会话的知识残留在后续召回里。
+        """
+
+        client = self.build_client()
+        items = self.chat(client, {"message": "公司一直不签劳动合同，想主张二倍工资，该怎么办？"})
+        session_id = items[0]["session_id"]
+        self.assertIsNotNone(self.memory_store.load(session_id))
+
+        response = client.delete(f"/api/sessions/{session_id}")
+
+        self.assertEqual(200, response.status_code)
+        self.assertIsNone(self.memory_store.load(session_id))
+
+    def test_memory_recalled_event_is_sanitized_for_web(self) -> None:
+        """
+        legal_memory_recalled 事件透传前端前必须过白名单：只保留计数与标题/摘要/时间。
+        """
+
+        safe_event = sanitize_event_for_web(
+            "legal_memory_recalled",
+            {
+                "count": 1,
+                "memories": [
+                    {
+                        "title": "此前的劳动合同咨询",
+                        "summary": "未签书面劳动合同争议。",
+                        "updated_at": "2026-07-01T00:00:00+00:00",
+                        "session_id": "sess_20260101_090000_aaaa",
+                        "score": 8,
+                    }
+                ],
+            },
+        )
+
+        self.assertIsNotNone(safe_event)
+        event_type, data = safe_event
+        self.assertEqual("legal_memory_recalled", event_type)
+        self.assertEqual(1, data["count"])
+        self.assertEqual(
+            {"title", "summary", "updated_at"},
+            set(data["memories"][0].keys()),
+        )
+
+    def test_selfheal_event_is_sanitized_for_web(self) -> None:
+        """
+        legal_selfheal 事件只透出环节名和动作；异常内文（detail）不得进入浏览器网络流。
+        """
+
+        safe_event = sanitize_event_for_web(
+            "legal_selfheal",
+            {"stage": "案件状态更新", "action": "degraded", "detail": "内部异常堆栈不应透出"},
+        )
+
+        self.assertIsNotNone(safe_event)
+        event_type, data = safe_event
+        self.assertEqual("legal_selfheal", event_type)
+        self.assertEqual({"stage", "action"}, set(data.keys()))
+        self.assertEqual("案件状态更新", data["stage"])
+        self.assertEqual("degraded", data["action"])
+
+    def test_turn_metrics_event_is_sanitized_for_web(self) -> None:
+        """
+        legal_turn_metrics 只透出白名单数值字段，未知字段一律剥掉。
+        """
+
+        safe_event = sanitize_event_for_web(
+            "legal_turn_metrics",
+            {
+                "stages": [{"stage": "案件状态更新", "duration_ms": 12, "status": "ok", "secret": "内部字段"}],
+                "total_duration_ms": 99,
+                "llm_usage": {"calls": 2, "input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "extra": 1},
+                "selfheal_count": 1,
+                "internal": "不应透出",
+            },
+        )
+
+        self.assertIsNotNone(safe_event)
+        event_type, data = safe_event
+        self.assertEqual("legal_turn_metrics", event_type)
+        self.assertEqual({"stages", "total_duration_ms", "llm_usage", "selfheal_count"}, set(data.keys()))
+        self.assertEqual({"stage", "duration_ms", "status"}, set(data["stages"][0].keys()))
+        self.assertEqual({"calls", "input_tokens", "output_tokens", "total_tokens"}, set(data["llm_usage"].keys()))
+
+    def test_metrics_endpoint_aggregates_committed_turns(self) -> None:
+        """
+        /api/metrics 应聚合成功轮次：轮数、成功率、总耗时和 LLM usage。
+        """
+
+        client = self.build_client()
+        self.chat(client, {"message": "公司一直不签劳动合同，想主张二倍工资，该怎么办？"})
+
+        data = client.get("/api/metrics").json()
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(1, data["turns"])
+        self.assertEqual(0, data["failed_turns"])
+        self.assertEqual(1.0, data["success_rate"])
+        self.assertEqual(1500, data["total_duration_ms"])
+        self.assertEqual(4, data["llm_calls"])
+        self.assertEqual(1200, data["total_tokens"])
+
+    def test_metrics_endpoint_counts_failed_turns(self) -> None:
+        """
+        失败轮进入 failed_turns，成功率随之下降。
+        """
+
+        factory, _ = self.make_factory(error=RuntimeError("boom"))
+        client = self.build_client(factory)
+        self.chat(client, {"message": "触发失败"})
+
+        data = client.get("/api/metrics").json()
+
+        self.assertEqual(0, data["turns"])
+        self.assertEqual(1, data["failed_turns"])
+        self.assertEqual(0.0, data["success_rate"])
+
+    def test_turn_committed_event_records_metrics(self) -> None:
+        """
+        轮级 metrics 应随 turn_committed 事件写入 events.jsonl，作为持久审计数据。
+        """
+
+        client = self.build_client()
+        items = self.chat(client, {"message": "公司一直不签劳动合同，想主张二倍工资，该怎么办？"})
+        session_id = items[0]["session_id"]
+
+        events_path = Path(self._tmp.name) / "sessions" / session_id / "events.jsonl"
+        lines = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        committed = [line for line in lines if line.get("type") == "turn_committed"]
+
+        self.assertEqual(1, len(committed))
+        metrics = committed[0]["data"].get("metrics")
+        self.assertIsInstance(metrics, dict)
+        self.assertEqual(4, metrics["llm_usage"]["calls"])
+        self.assertEqual(1500, metrics["total_duration_ms"])
 
     def test_chat_without_session_id_creates_and_persists_session(self) -> None:
         """

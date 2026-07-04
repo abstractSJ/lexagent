@@ -22,6 +22,12 @@ from pydantic import BaseModel
 
 from agent_system.agent.events import AgentEvent
 from agent_system.legal_consultation.factory import create_legal_consultation_session_factory
+from agent_system.memory import (
+    MemoryStore,
+    MemoryStoreError,
+    build_case_memory_from_snapshot,
+    recalled_memories_to_prompt_payload,
+)
 from agent_system.storage import SessionStore, SessionStoreError
 
 
@@ -30,6 +36,8 @@ STATIC_DIR = BASE_DIR / "static"
 NDJSON_MEDIA_TYPE = "application/x-ndjson"
 # 会话持久化根目录。相对路径基于项目根（uvicorn 从项目根启动），和 data/chroma 同级。
 DEFAULT_SESSIONS_DIR = Path("data") / "sessions"
+# 跨会话案件记忆根目录，与会话存档同级、互相独立：删除单个会话时只精确删除对应记忆。
+DEFAULT_MEMORY_DIR = Path("data") / "memory"
 
 
 class SupportsLegalWebSession(Protocol):
@@ -49,6 +57,7 @@ class SupportsLegalWebSession(Protocol):
         text: str,
         *,
         on_event: Callable[[AgentEvent], None] | None = None,
+        recalled_memories: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[AgentEvent]]:
         """
         执行一轮法律咨询，并通过回调实时输出过程事件。
@@ -56,6 +65,8 @@ class SupportsLegalWebSession(Protocol):
         Args:
             text: 用户输入的案情或追问。
             on_event: 可选过程事件回调。
+            recalled_memories: 可选跨会话历史记忆负载。后端只在确有召回时传入该参数，
+                因此不支持记忆的旧会话实现（含既有测试 fake）无需修改也能继续工作。
 
         Returns:
             tuple[str, list[AgentEvent]]: 最终回答和过程事件。
@@ -85,6 +96,9 @@ class ChatRequest(BaseModel):
 
 EVENT_TITLES: dict[str, str] = {
     "legal_step": "执行步骤",
+    "legal_selfheal": "链路自修复",
+    "legal_memory_recalled": "历史咨询记忆已唤起",
+    "legal_turn_metrics": "本轮执行指标",
     "legal_rag_query_started": "法条检索中",
     "case_state_updated": "案件状态已更新",
     "legal_missing_details_suggested": "可先补充的关键信息",
@@ -108,15 +122,17 @@ def create_app(
     *,
     session_factory: Callable[[], SupportsLegalWebSession] | None = None,
     store: SessionStore | None = None,
+    memory_store: MemoryStore | None = None,
 ) -> FastAPI:
     """
     创建 FastAPI 应用。
 
     Args:
         session: 可选法律咨询会话。传入时进入单会话兼容模式：所有请求共用该会话，
-            不做历史会话管理和磁盘持久化。主要供旧测试和特殊装配使用。
+            不做历史会话管理、磁盘持久化和跨会话记忆。主要供旧测试和特殊装配使用。
         session_factory: 可选会话工厂（多会话模式）。为空时使用共享重资源的默认工厂。
         store: 可选会话存储。为空且处于多会话模式时使用 `data/sessions` 默认目录。
+        memory_store: 可选跨会话记忆存储。为空且处于多会话模式时使用 `data/memory` 默认目录。
 
     Returns:
         FastAPI: 已挂载静态文件和接口路由的 Web 应用。
@@ -145,6 +161,8 @@ def create_app(
     app.state.legal_session = session
     app.state.session_factory = None if single_session_mode else (session_factory or create_legal_consultation_session_factory())
     app.state.store = None if single_session_mode else (store or SessionStore(DEFAULT_SESSIONS_DIR))
+    # 跨会话记忆与会话持久化同开同关：单会话兼容模式没有 session_id，无法沉淀和排除自身记忆。
+    app.state.memory_store = None if single_session_mode else (memory_store or MemoryStore(DEFAULT_MEMORY_DIR))
     # 内存中的活跃会话缓存：session_id -> 会话实例。磁盘快照在每轮成功后写入，
     # 缓存里的对象和磁盘内容保持一致；进程重启后按需从磁盘恢复。
     app.state.sessions = {}
@@ -243,7 +261,73 @@ def create_app(
             title=derive_session_title(messages),
             turn_count=turn_count,
         )
-        store_instance.append_event(session_id, "turn_committed", {"turn_count": turn_count}, turn_id=turn_count)
+        # 轮级 metrics 随 turn_committed 一起写入 events.jsonl：这是跨进程重启后仍可审计的
+        # 持久观测数据，/api/metrics 聚合就以它为唯一数据源。写盘前先过一遍 Web 白名单，
+        # 保证磁盘上的观测字段和推给浏览器的完全一致，不会多存内部诊断内容。
+        turn_event_data: dict[str, Any] = {"turn_count": turn_count}
+        metrics = extract_turn_metrics(events)
+        if metrics is not None:
+            turn_event_data["metrics"] = metrics
+        store_instance.append_event(session_id, "turn_committed", turn_event_data, turn_id=turn_count)
+
+    def recall_memories_for_input(user_input: str, session_id: str | None) -> list[dict[str, Any]]:
+        """
+        检索与本轮输入相关的跨会话历史记忆，返回可注入会话的白名单负载。
+
+        Args:
+            user_input: 本轮合并后的用户输入。
+            session_id: 当前会话 ID，用于排除该会话自身的记忆（其知识已在 case_state 里）。
+
+        Returns:
+            list[dict[str, Any]]: 白名单记忆负载；未启用记忆、无命中或检索失败时返回空列表。
+            记忆是辅助信号，任何异常都降级为“无记忆”，绝不阻断咨询链路。
+        """
+
+        memory_store_instance: MemoryStore | None = app.state.memory_store
+        if memory_store_instance is None:
+            return []
+        try:
+            recalls = memory_store_instance.search(user_input, exclude_session_id=session_id)
+            return recalled_memories_to_prompt_payload(recalls)
+        except Exception:
+            return []
+
+    def persist_case_memory(session_id: str | None, target_session: SupportsLegalWebSession) -> None:
+        """
+        把本轮提交后的案件知识沉淀为跨会话记忆（upsert，一会话一条）。
+
+        Args:
+            session_id: 会话 ID；单会话模式为 None，直接跳过。
+            target_session: 本轮使用的会话实例。
+
+        Why:
+            case_state 是状态更新 LLM 已经蒸馏过的结构化知识，这里做确定性提取即可完成
+            “知识沉淀”，不增加任何 LLM 调用。暂停补充轮同样提交了 case_state，因此同样沉淀。
+
+        Raises:
+            MemoryStoreError: 记忆写盘失败时抛出，由调用方降级为非致命提示。
+        """
+
+        memory_store_instance: MemoryStore | None = app.state.memory_store
+        if memory_store_instance is None or session_id is None:
+            return
+        export = getattr(target_session, "export_snapshot", None)
+        if not callable(export):
+            return
+
+        snapshot = export()
+        messages = snapshot.get("messages") if isinstance(snapshot.get("messages"), list) else []
+        turn_count = sum(1 for item in messages if isinstance(item, dict) and item.get("role") == "user")
+        memory = build_case_memory_from_snapshot(
+            session_id,
+            snapshot,
+            title=derive_session_title(messages),
+            turn_count=turn_count,
+        )
+        if memory is None:
+            # 案件状态还没有可沉淀内容（如首轮即失败恢复的空会话），跳过而不是写空记忆。
+            return
+        memory_store_instance.save(memory)
 
     def preload_current_session() -> None:
         """
@@ -383,6 +467,10 @@ def create_app(
                 raise HTTPException(status_code=500, detail=str(error)) from error
             raise
 
+        # 记忆检索在启动后台线程前完成：它只读本地小文件，毫秒级返回，
+        # 放在这里可以让整轮链路（包括状态更新 prompt）从一开始就带上历史背景。
+        recalled_memories = recall_memories_for_input(user_input, session_id)
+
         event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
         error_event_forwarded = False
         search_started_forwarded = False
@@ -439,7 +527,15 @@ def create_app(
             """
 
             try:
-                answer, events = target_session.ask_with_events(user_input, on_event=on_event)
+                if recalled_memories:
+                    answer, events = target_session.ask_with_events(
+                        user_input,
+                        on_event=on_event,
+                        recalled_memories=recalled_memories,
+                    )
+                else:
+                    # 无召回时不传该参数，兼容尚未支持记忆注入的旧会话实现和测试 fake。
+                    answer, events = target_session.ask_with_events(user_input, on_event=on_event)
                 try:
                     # 持久化在 final/pause 事件之前执行：前端收到 final 后可能立即刷新会话列表，
                     # 此时快照必须已经落盘，否则列表里拿到的还是上一轮的标题和轮次。
@@ -453,6 +549,18 @@ def create_app(
                             "event_type": "error",
                             "title": "会话保存失败",
                             "data": {"error": str(persist_error)},
+                        }
+                    )
+                try:
+                    persist_case_memory(session_id, target_session)
+                except Exception as memory_error:
+                    # 记忆沉淀失败同样不影响本轮回答，也不影响会话快照；单独软提示。
+                    push(
+                        {
+                            "type": "event",
+                            "event_type": "error",
+                            "title": "记忆沉淀失败",
+                            "data": {"error": str(memory_error)},
                         }
                     )
                 pause_event = find_event(events, "legal_supplement_required")
@@ -572,14 +680,72 @@ def create_app(
         if not app.state.chat_lock.acquire(blocking=False):
             raise HTTPException(status_code=409, detail="当前已有咨询正在处理，请稍后再删除。")
         try:
+            # 先删记忆再删会话目录：记忆删除失败时整个操作以 500 失败、会话保留，用户重试
+            # 即可；反过来先删会话，残留的记忆会让“已删除会话”的知识继续出现在召回里。
+            if app.state.memory_store is not None:
+                app.state.memory_store.delete(session_id)
             store_instance.delete_session(session_id)
             with app.state.registry_lock:
                 app.state.sessions.pop(session_id, None)
-        except SessionStoreError as error:
+        except (SessionStoreError, MemoryStoreError) as error:
             raise HTTPException(status_code=500, detail=str(error)) from error
         finally:
             app.state.chat_lock.release()
         return {"ok": True, "session_id": session_id}
+
+    @app.get("/api/metrics")
+    def metrics_summary() -> dict[str, Any]:
+        """
+        聚合所有会话的轮级运行指标。
+
+        Returns:
+            dict[str, Any]: 成功轮数、失败轮数、成功率、总耗时和 LLM usage 汇总。
+            单会话兼容模式没有持久化事件，返回全零结果。
+
+        Why:
+            直接扫描各会话的 events.jsonl 而不是维护内存计数器：turn_committed/turn_failed
+            本来就是每轮的持久审计流水，以它为唯一数据源可以让指标跨进程重启保持一致，
+            也不用引入任何新的存储结构。本地单用户的事件量很小，全量扫描足够快。
+        """
+
+        store_instance: SessionStore | None = app.state.store
+        turns = 0
+        failed_turns = 0
+        total_duration_ms = 0
+        llm_calls = 0
+        total_tokens = 0
+        if store_instance is not None:
+            for meta in store_instance.list_sessions():
+                try:
+                    session_events = store_instance.read_events(str(meta.get("session_id") or ""))
+                except SessionStoreError:
+                    # 单个会话事件文件损坏只影响该会话的统计；聚合指标是辅助观测，
+                    # 跳过坏会话继续汇总，不让一个坏文件把整个接口打成 500。
+                    continue
+                for item in session_events:
+                    item_type = item.get("type")
+                    if item_type == "turn_failed":
+                        failed_turns += 1
+                        continue
+                    if item_type != "turn_committed":
+                        continue
+                    turns += 1
+                    data = item.get("data") if isinstance(item.get("data"), dict) else {}
+                    turn_metrics = data.get("metrics") if isinstance(data.get("metrics"), dict) else {}
+                    total_duration_ms += safe_int(turn_metrics.get("total_duration_ms"))
+                    llm_usage = turn_metrics.get("llm_usage") if isinstance(turn_metrics.get("llm_usage"), dict) else {}
+                    llm_calls += safe_int(llm_usage.get("calls"))
+                    total_tokens += safe_int(llm_usage.get("total_tokens"))
+        completed = turns + failed_turns
+        return {
+            "ok": True,
+            "turns": turns,
+            "failed_turns": failed_turns,
+            "success_rate": round(turns / completed, 4) if completed else 0.0,
+            "total_duration_ms": total_duration_ms,
+            "llm_calls": llm_calls,
+            "total_tokens": total_tokens,
+        }
 
     return app
 
@@ -689,6 +855,27 @@ def extract_reference_materials(events: list[AgentEvent]) -> dict[str, Any]:
         "web": normalize_reference_materials(data.get("web"), limit=8),
         "warnings": normalize_safe_text_list(data.get("warnings"), limit=5),
     }
+
+
+def extract_turn_metrics(events: list[AgentEvent]) -> dict[str, Any] | None:
+    """
+    从本轮事件中提取白名单化的轮级运行指标。
+
+    Args:
+        events: 本轮业务事件。
+
+    Returns:
+        dict[str, Any] | None: 阶段耗时、总耗时、LLM usage 和自修复次数；本轮没有
+        metrics 事件时返回 None，调用方直接省略该字段而不是写入空对象。
+    """
+
+    event = find_event(events, "legal_turn_metrics")
+    if event is None or not isinstance(event.data, dict):
+        return None
+    safe_event = sanitize_event_for_web("legal_turn_metrics", event.data)
+    if safe_event is None:
+        return None
+    return safe_event[1]
 
 
 def extract_pending_supplement(events: list[AgentEvent], *, fallback_message: str) -> dict[str, Any] | None:
@@ -821,6 +1008,59 @@ def sanitize_event_for_web(event_type: str, data: dict[str, Any]) -> tuple[str, 
         return event_type, {
             "name": str(data.get("name") or ""),
             "status": str(data.get("status") or ""),
+        }
+    if event_type == "legal_selfheal":
+        # detail 是原始异常摘要，只留在内部事件里；浏览器只需要知道哪个环节发生了什么动作。
+        return event_type, {
+            "stage": truncate_safe_text(data.get("stage"), 40),
+            "action": truncate_safe_text(data.get("action"), 20),
+        }
+    if event_type == "legal_memory_recalled":
+        memories: list[dict[str, Any]] = []
+        for item in data.get("memories") or []:
+            if len(memories) >= 3:
+                break
+            if not isinstance(item, dict):
+                continue
+            title = truncate_safe_text(item.get("title"), 80)
+            if not title:
+                continue
+            memories.append(
+                {
+                    "title": title,
+                    "summary": truncate_safe_text(item.get("summary"), 160),
+                    "updated_at": truncate_safe_text(item.get("updated_at"), 40),
+                }
+            )
+        return event_type, {"count": safe_int(data.get("count")) or len(memories), "memories": memories}
+    if event_type == "legal_turn_metrics":
+        # 只保留数值型观测字段。stages 的 stage/status 是内部固定枚举文案，属于安全文本；
+        # 除白名单之外的任何字段（含未来新增的内部诊断字段）一律剥掉，避免顺带透出敏感内容。
+        stages: list[dict[str, Any]] = []
+        for item in data.get("stages") or []:
+            if len(stages) >= 12:
+                break
+            if not isinstance(item, dict):
+                continue
+            stage_name = truncate_safe_text(item.get("stage"), 40)
+            if not stage_name:
+                continue
+            stages.append(
+                {
+                    "stage": stage_name,
+                    "duration_ms": safe_int(item.get("duration_ms")),
+                    "status": truncate_safe_text(item.get("status"), 20),
+                }
+            )
+        raw_usage = data.get("llm_usage") if isinstance(data.get("llm_usage"), dict) else {}
+        return event_type, {
+            "stages": stages,
+            "total_duration_ms": safe_int(data.get("total_duration_ms")),
+            "llm_usage": {
+                key: safe_int(raw_usage.get(key))
+                for key in ("calls", "input_tokens", "output_tokens", "total_tokens")
+            },
+            "selfheal_count": safe_int(data.get("selfheal_count")),
         }
     if event_type == "case_state_updated":
         return event_type, {"status": "done", "version": safe_int(data.get("version"))}
@@ -976,6 +1216,17 @@ def build_event_title(event_type: str, data: dict[str, Any]) -> str:
         name = data.get("name") or EVENT_TITLES[event_type]
         status = "开始" if data.get("status") == "start" else data.get("status")
         return f"步骤：{status} {name}" if status else f"步骤：{name}"
+    if event_type == "legal_selfheal":
+        stage = data.get("stage") or "内部环节"
+        if data.get("action") == "retried":
+            return f"自修复：{stage}已自动重试"
+        return f"自修复：{stage}失败，已降级继续"
+    if event_type == "legal_memory_recalled":
+        return f"唤起历史咨询记忆：{data.get('count', 0)} 条"
+    if event_type == "legal_turn_metrics":
+        seconds = safe_int(data.get("total_duration_ms")) / 1000
+        llm_usage = data.get("llm_usage") if isinstance(data.get("llm_usage"), dict) else {}
+        return f"本轮执行指标：耗时 {seconds:.1f} 秒，LLM 调用 {safe_int(llm_usage.get('calls'))} 次"
     if event_type == "legal_rag_query_started":
         return "正在检索本地法条"
     if event_type == "legal_case_rag_done":

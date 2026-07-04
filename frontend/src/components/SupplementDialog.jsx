@@ -100,16 +100,16 @@ const SupplementDialog = memo(function SupplementDialog({ supplement, open, bloc
     }
 
     setError('');
-    const succeeded = await onContinue({
+    // 弹窗的开关完全交给上层管理：提交被接受时上层会同步关闭弹窗，失败时再恢复重开。
+    // 这里不能在 await 之后自行调用 onClose——onContinue 可能要等整轮流式响应结束才
+    // resolve，那时如果本轮又产生了新的补充建议弹窗，迟到的 onClose 会把它误关掉。
+    await onContinue({
       message: '我补充以下关键信息：',
       supplement_answers: supplementAnswers,
       selected_questions: selectedQuestionList,
       selected_evidence_gaps: selectedEvidenceList,
       free_text: trimmedFreeText,
     });
-    if (succeeded !== false) {
-      onClose();
-    }
   };
 
   return (

@@ -13,6 +13,7 @@ OpenAI Responses API 客户端封装。
 from pathlib import Path
 import base64
 import mimetypes
+import threading
 from typing import Any, Dict, Iterator, List, Sequence
 
 from openai import OpenAI
@@ -60,6 +61,17 @@ class OpenAIChatClient:
             client_kwargs["base_url"] = config.base_url
 
         self.client = OpenAI(**client_kwargs)
+
+        # 进程内 usage 累计，供可观测性读取调用次数和 token 消耗。
+        # 放在客户端层的原因是所有业务链路（子任务、planner、AgentRunner）共享同一个客户端实例，
+        # 在这里累计一次即可覆盖全部 LLM 调用，不需要每个调用方各自埋点。
+        self._usage_lock = threading.Lock()
+        self.usage_totals: Dict[str, int] = {
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
 
     def chat(
         self,
@@ -110,12 +122,19 @@ class OpenAIChatClient:
             # 封装层统一抛 RuntimeError，避免上层 Agent 直接依赖 OpenAI SDK 的异常细节。
             raise RuntimeError(f"LLM Responses 流式调用失败：{error}") from error
 
+        completed_usage: Dict[str, Any] | None = None
         for event in stream:
             # Responses API 的流式返回是事件流，不再是 Chat Completions 的 choices.delta。
             # 这里只向上层暴露纯文本片段，保持 ChatSession 和 CLI 的使用方式稳定。
             text_delta = self._extract_text_delta(event)
             if text_delta:
                 yield text_delta
+            usage = self._extract_completed_usage(event)
+            if usage:
+                completed_usage = usage
+        # usage 在流自然结束后统一入账；上层中途放弃迭代时本次调用不计数，
+        # 保证累计值只反映真正完成的调用。
+        self._record_usage_totals(completed_usage)
 
     def complete(
         self,
@@ -190,6 +209,7 @@ class OpenAIChatClient:
         except Exception as error:
             raise RuntimeError(f"LLM Responses 非流式完整调用失败：{error}") from error
 
+        self._record_usage_totals(self._normalize_usage(getattr(response, "usage", None)))
         return self._extract_response_text(response)
 
     def get_usage(
@@ -322,9 +342,68 @@ class OpenAIChatClient:
             request_params["previous_response_id"] = previous_response_id
 
         try:
-            return self.client.responses.create(**request_params)
+            response = self.client.responses.create(**request_params)
         except Exception as error:
             raise RuntimeError(f"LLM Responses 非流式调用失败：{error}") from error
+        self._record_usage_totals(self._normalize_usage(getattr(response, "usage", None)))
+        return response
+
+    def snapshot_usage_totals(self) -> Dict[str, int]:
+        """
+        返回进程内累计 usage 快照。
+
+        Returns:
+            Dict[str, int]: calls / input_tokens / output_tokens / total_tokens 的副本。
+            调用方在轮次前后各取一次快照做差，即可得到该轮的调用次数与 token 消耗。
+        """
+
+        with self._usage_lock:
+            return dict(self.usage_totals)
+
+    def _record_usage_totals(self, usage: Dict[str, Any] | None) -> None:
+        """
+        把一次完成的调用累计进 usage_totals。
+
+        Args:
+            usage: 已归一化的 usage 字典；兼容服务不回传 usage 时为 None/空，
+                此时只累计调用次数，token 保持不变。
+        """
+
+        with self._usage_lock:
+            self.usage_totals["calls"] += 1
+            if not usage:
+                return
+            input_tokens = safe_token_count(usage.get("input_tokens", usage.get("prompt_tokens")))
+            output_tokens = safe_token_count(usage.get("output_tokens", usage.get("completion_tokens")))
+            total_tokens = safe_token_count(usage.get("total_tokens"))
+            if total_tokens == 0:
+                total_tokens = input_tokens + output_tokens
+            self.usage_totals["input_tokens"] += input_tokens
+            self.usage_totals["output_tokens"] += output_tokens
+            self.usage_totals["total_tokens"] += total_tokens
+
+    def _extract_completed_usage(self, event: Any) -> Dict[str, Any] | None:
+        """
+        从流式 response.completed 事件中提取归一化 usage。
+
+        Args:
+            event: SDK 事件对象或兼容服务返回的 dict 事件。
+
+        Returns:
+            Dict[str, Any] | None: 归一化 usage；非完成事件或缺 usage 时返回 None。
+        """
+
+        if isinstance(event, dict):
+            if event.get("type") != "response.completed":
+                return None
+            response = event.get("response")
+            usage = response.get("usage") if isinstance(response, dict) else None
+        else:
+            if getattr(event, "type", None) != "response.completed":
+                return None
+            usage = getattr(getattr(event, "response", None), "usage", None)
+        normalized = self._normalize_usage(usage)
+        return normalized or None
 
     def _build_responses_request(
         self,
@@ -969,3 +1048,17 @@ class OpenAIChatClient:
                 raise ValueError(
                     f"第 {message_index} 条消息的第 {block_index} 个内容块缺少 type。"
                 )
+
+
+def safe_token_count(value: Any) -> int:
+    """
+    把 usage 字段安全转换为非负整数。
+
+    兼容服务可能返回字符串数字、浮点或 None；这里统一兜底为 0，
+    保证 usage 累计永远不会因为脏数据抛异常。
+    """
+
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0

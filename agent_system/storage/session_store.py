@@ -1,7 +1,7 @@
 """
 本地会话持久化存储层。
 
-按 AGENT_SESSION_PERSISTENCE_PLAN.md 的第一版方案实现文件存储：
+当前实现服务于法律咨询 Web 链路，使用轻量文件存储：
 
 ```text
 data/sessions/<session_id>/
@@ -239,6 +239,43 @@ class SessionStore:
 
         with self._lock:
             self._append_event_unlocked(session_id, event_type, data, turn_id=turn_id)
+
+    def read_events(self, session_id: str) -> list[dict[str, Any]]:
+        """
+        按写入顺序读取会话的全部过程事件。
+
+        Args:
+            session_id: 会话 ID。
+
+        Returns:
+            list[dict[str, Any]]: 事件对象列表；events.jsonl 尚不存在时返回空列表。
+            单行 JSON 损坏时跳过该行而不是整体失败：事件日志是观测与审计数据，
+            指标聚合宁可少统计一行，也不能因一个坏行让整个接口不可用。
+
+        Raises:
+            SessionStoreError: 会话不存在或事件文件不可读时抛出。
+        """
+
+        session_dir = self._require_session_dir(session_id)
+        events_path = session_dir / EVENTS_FILENAME
+        if not events_path.is_file():
+            return []
+        events: list[dict[str, Any]] = []
+        try:
+            with open(events_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        item = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(item, dict):
+                        events.append(item)
+        except OSError as error:
+            raise SessionStoreError(f"读取会话事件失败：{error}") from error
+        return events
 
     def _append_event_unlocked(
         self,

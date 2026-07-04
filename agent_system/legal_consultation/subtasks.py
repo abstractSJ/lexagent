@@ -268,6 +268,117 @@ class SupportsComplete(Protocol):
         """
 
 
+def complete_structured_subtask(
+    llm: SupportsComplete,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    options: LLMCallOptions,
+    parser: Callable[[str], Any],
+    stage: str,
+    transport_retries: int = 1,
+    max_repair_attempts: int = 1,
+) -> tuple[Any, list[str]]:
+    """
+    执行一次带自修复能力的结构化 LLM 子任务调用。
+
+    自修复覆盖两类失败（沿用 query planner 已验证的修复模式）：
+    1. 传输失败（网络中断、接口异常）：原样重试，最多 transport_retries 次。
+    2. 输出解析失败（非法 JSON、字段校验不过）：把上一次原始输出和错误信息拼进修复
+       prompt 再调用，最多 max_repair_attempts 次。修复重试只在失败时发生，
+       成功链路仍然只有一次调用，不改变“一轮 4 次 LLM 调用”的既有结构。
+
+    Args:
+        llm: 支持 complete() 的 LLM 客户端。
+        system_prompt: 子任务 system 提示词，重试时保持不变。
+        user_prompt: 子任务用户提示词。
+        options: LLM 调用参数。
+        parser: 把原始响应解析为业务对象的函数；解析或校验失败时应抛 ValueError。
+        stage: 子任务名称，用于 warning 文案和最终异常信息。
+        transport_retries: 传输失败的最大重试次数。
+        max_repair_attempts: 解析失败的最大修复重试次数。
+
+    Returns:
+        tuple[Any, list[str]]: 解析结果和自修复过程 warning 列表（一次成功时为空）。
+
+    Raises:
+        Exception: 传输重试耗尽时抛出最后一次原始异常。
+        ValueError: 修复重试耗尽后输出仍不合法时抛出。
+    """
+
+    warnings: list[str] = []
+    raw_response = ""
+    for attempt in range(transport_retries + 1):
+        try:
+            raw_response = llm.complete(
+                [system_message(system_prompt), user_message(user_prompt)],
+                options=options,
+            )
+            break
+        except Exception as error:
+            if attempt >= transport_retries:
+                raise
+            warnings.append(f"{stage}调用失败，已自动重试：{truncate_text(str(error), 120)}")
+
+    try:
+        return parser(raw_response), warnings
+    except ValueError as error:
+        errors = [str(error)]
+
+    latest_raw = raw_response
+    for _ in range(max_repair_attempts):
+        repair_prompt = build_structured_repair_prompt(
+            user_prompt=user_prompt,
+            raw_response=latest_raw,
+            errors=errors,
+        )
+        # 修复调用再次传输失败时直接向上抛：连续两类故障叠加说明服务当前不可用，
+        # 继续在子任务里打转不如交给会话层降级。
+        latest_raw = llm.complete(
+            [system_message(system_prompt), user_message(repair_prompt)],
+            options=options,
+        )
+        try:
+            parsed = parser(latest_raw)
+            warnings.append(f"{stage}输出不合法，经修复重试后已恢复。")
+            return parsed, warnings
+        except ValueError as error:
+            errors = [str(error)]
+
+    raise ValueError(f"{stage}在修复重试后仍无法输出合法结果：{'；'.join(errors)}")
+
+
+def build_structured_repair_prompt(
+    *,
+    user_prompt: str,
+    raw_response: str,
+    errors: list[str],
+) -> str:
+    """
+    构造结构化输出的修复重试提示词。
+
+    修复 prompt 必须携带原任务、上一次原始输出和具体错误，模型才能针对性修正，
+    而不是盲目重新生成一遍。
+    """
+
+    return f"""
+你上一次的输出无法通过解析或校验，请修复后重新输出。
+
+【原始任务】
+{user_prompt}
+
+【你上一次的输出】
+{truncate_text(raw_response, 2000)}
+
+【解析/校验错误】
+{json.dumps(errors, ensure_ascii=False)}
+
+【修复要求】
+1. 只输出修复后的完整合法 JSON。
+2. 不要输出 Markdown 代码块、解释文字或道歉。
+""".strip()
+
+
 @dataclass(frozen=True)
 class RetrievalJob:
     """
@@ -332,6 +443,7 @@ class LegalCaseStateUpdater:
         previous_state: LegalCaseState,
         public_messages: list[Message],
         user_input: str,
+        recalled_memories: list[dict[str, Any]] | None = None,
     ) -> LegalStateUpdate:
         """
         根据本轮用户输入更新案件状态。
@@ -340,39 +452,57 @@ class LegalCaseStateUpdater:
             previous_state: 上一轮已提交的案件状态。
             public_messages: 公开主会话历史，只包含 system/user/assistant。
             user_input: 本轮用户原始输入。
+            recalled_memories: 可选跨会话历史记忆，仅作为理解上下文的背景注入 prompt。
 
         Returns:
-            LegalStateUpdate: 更新后的案件状态和变化说明。
+            LegalStateUpdate: 更新后的案件状态和变化说明；自修复过程记录在 warnings 里。
+
+        Raises:
+            Exception: 传输重试耗尽时抛出。
+            ValueError: 修复重试后输出仍不合法时抛出。
         """
 
-        messages = [
-            system_message(STATE_UPDATE_SYSTEM_PROMPT),
-            user_message(
-                build_state_update_user_prompt(
-                    previous_state=previous_state,
-                    public_messages=public_messages,
-                    user_input=user_input,
-                )
-            ),
-        ]
-        raw_response = self.llm.complete(messages, options=self.options)
-        data = parse_json_object(raw_response)
-        state_data = data.get("state") if isinstance(data.get("state"), dict) else data
-        state = legal_case_state_from_dict(
-            state_data,
-            fallback=previous_state,
-            version=previous_state.version + 1,
+        user_prompt = build_state_update_user_prompt(
+            previous_state=previous_state,
+            public_messages=public_messages,
+            user_input=user_input,
+            recalled_memories=recalled_memories,
         )
-        return LegalStateUpdate(
-            state=state,
-            newly_added_facts=normalize_string_list(data.get("newly_added_facts"), max_items=20),
-            changed_facts=normalize_string_list(data.get("changed_facts"), max_items=20),
-            warnings=normalize_string_list(data.get("warnings"), max_items=20),
-            should_pause_for_supplement=parse_bool(data.get("should_pause_for_supplement")),
-            pause_reason=normalize_text(data.get("pause_reason")),
-            supplement_questions=normalize_string_list(data.get("supplement_questions"), max_items=5),
-            supplement_evidence_gaps=normalize_string_list(data.get("supplement_evidence_gaps"), max_items=5),
+
+        def parse_state_update(raw_response: str) -> LegalStateUpdate:
+            """
+            把原始响应解析为状态更新结果，非法输入抛 ValueError 触发修复重试。
+            """
+
+            data = parse_json_object(raw_response)
+            state_data = data.get("state") if isinstance(data.get("state"), dict) else data
+            state = legal_case_state_from_dict(
+                state_data,
+                fallback=previous_state,
+                version=previous_state.version + 1,
+            )
+            return LegalStateUpdate(
+                state=state,
+                newly_added_facts=normalize_string_list(data.get("newly_added_facts"), max_items=20),
+                changed_facts=normalize_string_list(data.get("changed_facts"), max_items=20),
+                warnings=normalize_string_list(data.get("warnings"), max_items=20),
+                should_pause_for_supplement=parse_bool(data.get("should_pause_for_supplement")),
+                pause_reason=normalize_text(data.get("pause_reason")),
+                supplement_questions=normalize_string_list(data.get("supplement_questions"), max_items=5),
+                supplement_evidence_gaps=normalize_string_list(data.get("supplement_evidence_gaps"), max_items=5),
+            )
+
+        update, selfheal_warnings = complete_structured_subtask(
+            self.llm,
+            system_prompt=STATE_UPDATE_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            options=self.options,
+            parser=parse_state_update,
+            stage="案件状态更新",
         )
+        if selfheal_warnings:
+            update = replace(update, warnings=[*update.warnings, *selfheal_warnings])
+        return update
 
 
 class LegalCaseRagSubtask:
@@ -860,43 +990,59 @@ class LegalCaseAnalyzer:
             rag: 本轮法条 RAG 结果。
 
         Returns:
-            LegalCaseAnalysis: 风险项、案情目录和下一步动作的合并结果。
+            LegalCaseAnalysis: 风险项、案情目录和下一步动作的合并结果；自修复过程记录在
+            warnings 里。
 
         Raises:
-            ValueError: LLM 输出不是合法 JSON 或 risks 字段不是列表时抛出。
+            Exception: 传输重试耗尽时抛出。
+            ValueError: 修复重试后输出仍不是合法 JSON 或 risks 字段不是列表时抛出。
         """
 
-        messages = [
-            system_message(CASE_ANALYSIS_SYSTEM_PROMPT),
-            user_message(build_case_analysis_user_prompt(state=state, rag=rag)),
-        ]
-        raw_response = self.llm.complete(messages, options=self.options)
-        data = parse_json_object(raw_response)
+        user_prompt = build_case_analysis_user_prompt(state=state, rag=rag)
 
-        raw_risks = data.get("risks", [])
-        if not isinstance(raw_risks, list):
-            raise ValueError("综合分析结果字段 risks 必须是列表。")
-        risks = [risk_from_dict(item) for item in raw_risks if isinstance(item, dict)]
+        def parse_case_analysis(raw_response: str) -> LegalCaseAnalysis:
+            """
+            把原始响应解析为综合分析结果，非法输入抛 ValueError 触发修复重试。
+            """
 
-        catalog_data = data.get("catalog") if isinstance(data.get("catalog"), dict) else {}
-        catalog = LegalAnalysisCatalog(
-            case_points=normalize_string_list(catalog_data.get("case_points"), max_items=12),
-            legal_concepts=normalize_string_list(catalog_data.get("legal_concepts"), max_items=12),
-            follow_up_questions=normalize_string_list(catalog_data.get("follow_up_questions"), max_items=12),
+            data = parse_json_object(raw_response)
+
+            raw_risks = data.get("risks", [])
+            if not isinstance(raw_risks, list):
+                raise ValueError("综合分析结果字段 risks 必须是列表。")
+            risks = [risk_from_dict(item) for item in raw_risks if isinstance(item, dict)]
+
+            catalog_data = data.get("catalog") if isinstance(data.get("catalog"), dict) else {}
+            catalog = LegalAnalysisCatalog(
+                case_points=normalize_string_list(catalog_data.get("case_points"), max_items=12),
+                legal_concepts=normalize_string_list(catalog_data.get("legal_concepts"), max_items=12),
+                follow_up_questions=normalize_string_list(catalog_data.get("follow_up_questions"), max_items=12),
+            )
+
+            action_data = data.get("next_action") if isinstance(data.get("next_action"), dict) else {}
+            action = str(action_data.get("action", NEXT_ACTION_ASK_FOLLOWUP)).strip()
+            if action not in VALID_NEXT_ACTIONS:
+                # 非法 action 降级为追问。原因是追问比错误地给出结论更安全。
+                action = NEXT_ACTION_ASK_FOLLOWUP
+            next_action = LegalNextAction(
+                action=action,
+                reasons=normalize_string_list(action_data.get("reasons"), max_items=8),
+                questions_to_ask=normalize_string_list(action_data.get("questions_to_ask"), max_items=8),
+                should_correct_previous_answer=parse_bool(action_data.get("should_correct_previous_answer")),
+            )
+            return LegalCaseAnalysis(risks=risks, catalog=catalog, next_action=next_action)
+
+        analysis, selfheal_warnings = complete_structured_subtask(
+            self.llm,
+            system_prompt=CASE_ANALYSIS_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            options=self.options,
+            parser=parse_case_analysis,
+            stage="案情综合分析",
         )
-
-        action_data = data.get("next_action") if isinstance(data.get("next_action"), dict) else {}
-        action = str(action_data.get("action", NEXT_ACTION_ASK_FOLLOWUP)).strip()
-        if action not in VALID_NEXT_ACTIONS:
-            # 非法 action 降级为追问。原因是追问比错误地给出结论更安全。
-            action = NEXT_ACTION_ASK_FOLLOWUP
-        next_action = LegalNextAction(
-            action=action,
-            reasons=normalize_string_list(action_data.get("reasons"), max_items=8),
-            questions_to_ask=normalize_string_list(action_data.get("questions_to_ask"), max_items=8),
-            should_correct_previous_answer=parse_bool(action_data.get("should_correct_previous_answer")),
-        )
-        return LegalCaseAnalysis(risks=risks, catalog=catalog, next_action=next_action)
+        if selfheal_warnings:
+            analysis = replace(analysis, warnings=[*analysis.warnings, *selfheal_warnings])
+        return analysis
 
 
 def build_state_update_user_prompt(
@@ -904,17 +1050,29 @@ def build_state_update_user_prompt(
     previous_state: LegalCaseState,
     public_messages: list[Message],
     user_input: str,
+    recalled_memories: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     构造案件状态更新子任务的用户提示词。
     """
+
+    memory_block = ""
+    if recalled_memories:
+        # 跨会话记忆只做背景参考。状态更新器最容易犯的错是把历史咨询事实当成本案事实合并，
+        # 因此注入时必须同时带上使用纪律，而不是只给数据。
+        memory_block = f"""
+【历史咨询记忆（跨会话背景，仅供理解上下文）】
+{json.dumps(recalled_memories, ensure_ascii=False, indent=2)}
+注意：历史记忆来自该用户此前其他咨询会话，不是本案已确认事实；除非用户本轮输入明确延续该事项，
+否则不得把历史记忆内容写入 confirmed_facts、timeline 或其他事实字段。
+"""
 
     return f"""
 请更新案件状态。
 
 【上一轮结构化案件状态】
 {json.dumps(asdict(previous_state), ensure_ascii=False, indent=2)}
-
+{memory_block}
 【最近公开对话】
 {json.dumps(compact_public_messages(public_messages), ensure_ascii=False, indent=2)}
 

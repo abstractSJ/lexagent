@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, fields
 import json
 import re
+import time
 from typing import Any, Callable, Protocol
 
 from agent_system.agent.events import AgentEvent
@@ -23,6 +24,8 @@ from agent_system.config import LLMCallOptions
 from agent_system.llm.messages import Message, assistant_message, system_message, user_message
 from agent_system.legal_consultation.models import (
     LegalAnalysisCatalog,
+    LegalCaseAnalysis,
+    LegalCaseRagResult,
     LegalCaseState,
     LegalConsultationTurnResult,
     LegalNextAction,
@@ -31,6 +34,7 @@ from agent_system.legal_consultation.models import (
     LegalStateUpdate,
     LegalWebSearchResearchResult,
 )
+from agent_system.planning.legal_query_planner import LegalQueryPlan
 from agent_system.legal_consultation.subtasks import (
     WEB_SEARCH_PURPOSE_LABELS,
     LegalCaseAnalyzer,
@@ -138,6 +142,7 @@ class LegalConsultationSession:
         web_search_subtask: SupportsWebSearchSubtask | None = None,
         system_prompt: str | None = None,
         answer_options: AgentRunOptions | None = None,
+        usage_source: Any = None,
     ) -> None:
         self.state_updater = state_updater
         self.rag_subtask = rag_subtask
@@ -145,6 +150,9 @@ class LegalConsultationSession:
         self.answer_runner = answer_runner
         self.web_search_subtask = web_search_subtask
         self.answer_options = answer_options or FINAL_ANSWER_OPTIONS
+        # usage_source 是轮级 metrics 读取 LLM usage 累计的对象。默认取状态更新器的 llm：
+        # 工厂装配时全链路共享同一个客户端实例，从任一子任务拿到的都是同一份累计值。
+        self.usage_source = usage_source if usage_source is not None else getattr(state_updater, "llm", None)
         self.case_state = LegalCaseState()
         self.public_messages: list[Message] = []
 
@@ -181,6 +189,7 @@ class LegalConsultationSession:
         text: str,
         *,
         on_event: Callable[[AgentEvent], None] | None = None,
+        recalled_memories: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[AgentEvent]]:
         """
         执行一轮完整法律咨询链路。
@@ -188,6 +197,8 @@ class LegalConsultationSession:
         Args:
             text: 用户原始输入。
             on_event: 可选实时事件回调。CLI 可用它在长耗时步骤开始时立即打印进度。
+            recalled_memories: 可选跨会话历史记忆（白名单字段字典列表，通常由 Web 层
+                从 MemoryStore 检索后传入）。记忆只注入内部 prompt 和事件，不进入公开 history。
 
         Returns:
             tuple[str, list[AgentEvent]]: 最终答复和过程事件。
@@ -204,14 +215,44 @@ class LegalConsultationSession:
         old_state = self.case_state
         old_messages = [dict(message) for message in self.public_messages]
         events: list[AgentEvent] = []
+        # 轮级可观测性：记录整轮和各阶段耗时，以及本轮 LLM usage 增量（轮前后快照做差）。
+        turn_started_at = time.perf_counter()
+        stage_metrics: list[dict[str, Any]] = []
+        usage_before = snapshot_llm_usage(self.usage_source)
+        # 历史记忆先做一遍清洗：记忆是辅助信号，脏数据（空条目、非字典）直接丢弃，
+        # 绝不能让它打断正常咨询链路。
+        memories = sanitize_recalled_memories(recalled_memories)
 
         try:
+            if memories:
+                # 记忆唤起事件放在链路最前面：让用户第一时间看到“结合了哪些历史咨询”，
+                # 也保证后续状态更新的输入口径与事件展示一致。
+                record_event(events, on_event, build_memory_recalled_event(memories))
             record_event(events, on_event, build_step_event("案件状态更新", "start"))
-            state_update = self.state_updater.update(
-                previous_state=old_state,
-                public_messages=self.public_messages,
-                user_input=user_input,
-            )
+            stage_started_at = time.perf_counter()
+            stage_status = "ok"
+            try:
+                state_update = self.state_updater.update(
+                    previous_state=old_state,
+                    public_messages=self.public_messages,
+                    user_input=user_input,
+                    recalled_memories=memories or None,
+                )
+            except Exception as error:
+                # 状态更新失败（含子任务内部重试耗尽）不让整轮咨询报废：降级为沿用既有
+                # 案件状态。后续 RAG 与最终回答仍然拿得到用户原始输入，可给出可用的阶段性
+                # 意见；降级轮自然不触发暂停补充逻辑。
+                stage_status = "degraded"
+                state_update = LegalStateUpdate(
+                    state=old_state,
+                    warnings=[f"案件状态更新失败，本轮沿用既有案件状态继续分析：{truncate_text(str(error), 160)}"],
+                )
+                record_event(
+                    events,
+                    on_event,
+                    build_selfheal_event(stage="案件状态更新", action="degraded", detail=str(error)),
+                )
+            stage_metrics.append(build_stage_metric("案件状态更新", stage_started_at, stage_status))
             record_event(events, on_event, build_state_event(state_update))
             missing_details_event = build_missing_details_event(state_update)
             if missing_details_event is not None:
@@ -220,6 +261,17 @@ class LegalConsultationSession:
             if state_update.should_pause_for_supplement:
                 supplement_message = build_supplement_prompt_message(state_update)
                 record_event(events, on_event, build_supplement_required_event(state_update, supplement_message))
+                record_event(
+                    events,
+                    on_event,
+                    build_turn_metrics_event(
+                        stages=stage_metrics,
+                        turn_started_at=turn_started_at,
+                        usage_before=usage_before,
+                        usage_source=self.usage_source,
+                        events=events,
+                    ),
+                )
                 # 暂停补充是一次成功轮次。原因是用户已经给出新事实，状态更新也已完成；
                 # 只是后续 RAG/风险/最终回答需要等用户补齐阻塞性信息后再执行。
                 self.case_state = state_update.state
@@ -232,6 +284,7 @@ class LegalConsultationSession:
             # 因此案件状态更新一完成就后台启动，让第三方搜索的等待时间和本地 RAG、综合分析
             # 全程重叠；这是本链路耗时最长的可并行段。
             web_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="legal-web-subtask")
+            web_timing_sink: dict[str, int] = {}
             web_future = web_executor.submit(
                 self._run_web_search_subtask,
                 user_input=user_input,
@@ -240,14 +293,29 @@ class LegalConsultationSession:
                 risks=None,
                 catalog=None,
                 next_action=None,
+                timing_sink=web_timing_sink,
             )
             try:
                 record_event(events, on_event, build_step_event("案情拆解 + 多 query RAG", "start"))
-                rag = self.rag_subtask.run(
-                    case_text=user_input,
-                    state=state_update.state,
-                    on_event=lambda event: record_event(events, on_event, event),
-                )
+                stage_started_at = time.perf_counter()
+                stage_status = "ok"
+                try:
+                    rag = self.rag_subtask.run(
+                        case_text=user_input,
+                        state=state_update.state,
+                        on_event=lambda event: record_event(events, on_event, event),
+                    )
+                except Exception as error:
+                    # 规划或检索失败降级为空法条证据：综合分析与最终回答改用通用法律知识
+                    # 和公网资料继续；prompt 纪律会约束模型对资料不足处明说“需核实”。
+                    stage_status = "degraded"
+                    rag = build_degraded_rag_result(error)
+                    record_event(
+                        events,
+                        on_event,
+                        build_selfheal_event(stage="案情拆解 + 多 query RAG", action="degraded", detail=str(error)),
+                    )
+                stage_metrics.append(build_stage_metric("案情拆解 + 多 query RAG", stage_started_at, stage_status))
                 record_event(
                     events,
                     on_event,
@@ -265,7 +333,23 @@ class LegalConsultationSession:
                 record_event(events, on_event, build_step_event("案情综合分析", "start"))
                 # 风险识别、案情目录和下一步动作共享同一份输入，由综合分析器一次 LLM 调用产出。
                 # 事件仍按三个独立步骤发出，保持 CLI 和 Web 前端的展示协议不变。
-                analysis = self.case_analyzer.analyze(state=state_update.state, rag=rag)
+                stage_started_at = time.perf_counter()
+                stage_status = "ok"
+                try:
+                    analysis = self.case_analyzer.analyze(state=state_update.state, rag=rag)
+                except Exception as error:
+                    # 综合分析失败降级为空风险 + 默认追问动作：追问比缺分析支撑的结论更安全，
+                    # 最终回答仍能基于案件状态和已检索资料给出阶段性意见。
+                    stage_status = "degraded"
+                    analysis = LegalCaseAnalysis(
+                        warnings=[f"案情综合分析失败，已降级为空风险与默认追问动作：{truncate_text(str(error), 160)}"],
+                    )
+                    record_event(
+                        events,
+                        on_event,
+                        build_selfheal_event(stage="案情综合分析", action="degraded", detail=str(error)),
+                    )
+                stage_metrics.append(build_stage_metric("案情综合分析", stage_started_at, stage_status))
                 risks = analysis.risks
                 catalog = analysis.catalog
                 next_action = analysis.next_action
@@ -322,6 +406,15 @@ class LegalConsultationSession:
                     },
                 ),
             )
+            # 公网检索与本地链路并行，耗时由子任务线程自行测量后经 sink 带回；
+            # 失败已在子任务内降级为 warning，阶段状态始终按 ok 记录。
+            stage_metrics.append(
+                {
+                    "stage": "公网案例与司法实践检索",
+                    "duration_ms": max(0, int(web_timing_sink.get("duration_ms") or 0)),
+                    "status": "ok",
+                }
+            )
             reference_materials = build_reference_materials(rag=rag, web_research=web_research)
             record_event(events, on_event, build_reference_materials_event(reference_materials))
 
@@ -336,6 +429,7 @@ class LegalConsultationSession:
                         catalog=catalog,
                         next_action=next_action,
                         web_research=web_research,
+                        recalled_memories=memories,
                     )
                 )
             )
@@ -358,12 +452,34 @@ class LegalConsultationSession:
 
                 on_delta = push_answer_delta
 
-            answer, agent_events = self.answer_runner.run(
-                runtime_messages,
-                options=self.answer_options,
-                on_delta=on_delta,
-            )
-            if sanitizer is not None and on_event is not None:
+            streamed_successfully = False
+            stage_started_at = time.perf_counter()
+            final_answer_status = "ok"
+            try:
+                answer, agent_events = self.answer_runner.run(
+                    runtime_messages,
+                    options=self.answer_options,
+                    on_delta=on_delta,
+                )
+                streamed_successfully = on_delta is not None
+            except Exception as error:
+                # 最终回答是唯一没有降级产物的环节：失败后原样自动重试一次。重试改为非流式，
+                # 原因是首次尝试可能已推送过部分增量，再次流式会在聊天气泡里叠加两份文本；
+                # 非流式重试的完整答案由 final 事件一次性替换气泡。重试再失败则向上抛出，
+                # 走既有的整轮回滚。
+                final_answer_status = "retried"
+                record_event(
+                    events,
+                    on_event,
+                    build_selfheal_event(stage="最终回答生成", action="retried", detail=str(error)),
+                )
+                answer, agent_events = self.answer_runner.run(
+                    runtime_messages,
+                    options=self.answer_options,
+                    on_delta=None,
+                )
+            stage_metrics.append(build_stage_metric("最终回答生成", stage_started_at, final_answer_status))
+            if streamed_successfully and sanitizer is not None and on_event is not None:
                 tail_delta = sanitizer.flush()
                 if tail_delta:
                     on_event(AgentEvent(type="answer_delta", data={"delta": tail_delta}))
@@ -374,6 +490,18 @@ class LegalConsultationSession:
                 if agent_event.type == "message_done" and isinstance(agent_event.data, dict):
                     agent_event = AgentEvent(type=agent_event.type, data={**agent_event.data, "text": answer})
                 record_event(events, on_event, agent_event)
+
+            record_event(
+                events,
+                on_event,
+                build_turn_metrics_event(
+                    stages=stage_metrics,
+                    turn_started_at=turn_started_at,
+                    usage_before=usage_before,
+                    usage_source=self.usage_source,
+                    events=events,
+                ),
+            )
 
             self.case_state = committed_state
             self.public_messages.append(user_message(user_input))
@@ -403,27 +531,37 @@ class LegalConsultationSession:
         risks: list[Any] | None,
         catalog: LegalAnalysisCatalog | None,
         next_action: LegalNextAction | None,
+        timing_sink: dict[str, int] | None = None,
     ) -> LegalWebSearchResearchResult:
         """
         执行确定性公网检索，并把异常转为 warnings。
 
         这样做的原因是公网搜索属于补充材料，不应因为搜索配额、网络或第三方接口问题中断
         本地法条分析和最终阶段性答复。
+
+        Args:
+            timing_sink: 可选耗时回传字典。公网检索在独立线程运行，由本方法自测耗时写入
+                sink，主线程等待结束后读取；这样 metrics 记录的是真实工作耗时而非等待耗时。
         """
 
-        if self.web_search_subtask is None:
-            return LegalWebSearchResearchResult(warnings=["未配置公网案例与司法实践检索子任务。"])
+        started_at = time.perf_counter()
         try:
-            return self.web_search_subtask.run(
-                user_input=user_input,
-                state=state,
-                rag=rag,
-                risks=risks,
-                catalog=catalog,
-                next_action=next_action,
-            )
-        except Exception as error:
-            return LegalWebSearchResearchResult(warnings=[f"公网案例与司法实践检索失败：{error}"])
+            if self.web_search_subtask is None:
+                return LegalWebSearchResearchResult(warnings=["未配置公网案例与司法实践检索子任务。"])
+            try:
+                return self.web_search_subtask.run(
+                    user_input=user_input,
+                    state=state,
+                    rag=rag,
+                    risks=risks,
+                    catalog=catalog,
+                    next_action=next_action,
+                )
+            except Exception as error:
+                return LegalWebSearchResearchResult(warnings=[f"公网案例与司法实践检索失败：{error}"])
+        finally:
+            if timing_sink is not None:
+                timing_sink["duration_ms"] = elapsed_ms(started_at)
 
     def ask_with_result(self, text: str) -> LegalConsultationTurnResult:
         """
@@ -950,12 +1088,23 @@ def build_runtime_agent_input(
     catalog: LegalAnalysisCatalog,
     next_action: LegalNextAction,
     web_research: LegalWebSearchResearchResult | None = None,
+    recalled_memories: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     构造给最终 AgentRunner 的本轮临时增强输入。
 
     该输入会参与最终回答生成，但成功后不会作为用户原文写入公开 history。
     """
+
+    memory_block = ""
+    if recalled_memories:
+        # 历史记忆区块只在确有召回时插入，保持无记忆场景的 prompt 与旧版本完全一致。
+        memory_block = f"""
+【历史咨询记忆】
+以下是该用户此前其他咨询会话沉淀的背景记忆，仅供理解上下文。历史记忆不是本案事实和依据，
+不得据此编造本案未提供的事实；如与本案明显相关，可在回答中用一句话自然呼应既往咨询。
+{json.dumps(recalled_memories, ensure_ascii=False, indent=2)}
+"""
 
     return f"""
 请基于以下运行时上下文回答用户。本段是内部结构化上下文，不要向用户暴露“内部子任务”字样。
@@ -965,7 +1114,7 @@ def build_runtime_agent_input(
 
 【最新案件状态】
 {json.dumps(asdict(state), ensure_ascii=False, indent=2)}
-
+{memory_block}
 【案情拆解与检索计划】
 {json.dumps(query_plan_to_prompt_dict(rag.query_plan), ensure_ascii=False, indent=2)}
 
@@ -1000,6 +1149,232 @@ def build_runtime_agent_input(
 8. 不得编造未检索到的条文内容、案例或链接；上下文资料不足以支撑某个判断时明说“需核实”，不要硬答。
 9. 结尾必须提示：以下内容仅作一般信息参考，不构成正式法律意见。
 """.strip()
+
+
+# 单轮注入的历史记忆上限。跨会话记忆是背景信号而不是本案证据，条数放开只会稀释
+# 状态更新和最终回答对本案事实的注意力。
+MAX_RECALLED_MEMORIES = 3
+
+
+def sanitize_recalled_memories(value: Any) -> list[dict[str, Any]]:
+    """
+    清洗外部传入的历史记忆列表。
+
+    Args:
+        value: 调用方传入的原始记忆负载，期望是白名单字段字典列表。
+
+    Returns:
+        list[dict[str, Any]]: 只保留合法条目和白名单字段的记忆列表；无有效内容时返回空列表。
+
+    Why:
+        记忆来自磁盘文件且经由 Web 层透传，字段可能缺失或被手工改坏。会话层自己再做一次
+        逐字段清洗，保证注入 prompt 的结构永远可控，也让直接调用会话 API 的测试和脚本
+        不依赖上游是否规范。
+    """
+
+    if not isinstance(value, list):
+        return []
+
+    memories: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        summary = str(item.get("summary") or "").strip()
+        if not title and not summary:
+            continue
+        memories.append(
+            {
+                "title": truncate_text(title, 60),
+                "summary": truncate_text(summary, 200),
+                "key_facts": normalize_memory_text_list(item.get("key_facts"), max_items=5),
+                "user_goals": normalize_memory_text_list(item.get("user_goals"), max_items=3),
+                "legal_concepts": normalize_memory_text_list(item.get("legal_concepts"), max_items=6),
+                "updated_at": str(item.get("updated_at") or "").strip(),
+            }
+        )
+        if len(memories) >= MAX_RECALLED_MEMORIES:
+            break
+    return memories
+
+
+def normalize_memory_text_list(value: Any, *, max_items: int) -> list[str]:
+    """
+    规范化记忆条目里的字符串列表字段。
+    """
+
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        normalized.append(truncate_text(text, 80))
+        if len(normalized) >= max_items:
+            break
+    return normalized
+
+
+def build_memory_recalled_event(memories: list[dict[str, Any]]) -> AgentEvent:
+    """
+    构造历史记忆唤起事件。
+
+    事件面向前端进度区展示，只携带标题、短摘要和更新时间；完整记忆内容只进内部 prompt。
+    """
+
+    return AgentEvent(
+        type="legal_memory_recalled",
+        data={
+            "count": len(memories),
+            "memories": [
+                {
+                    "title": item["title"],
+                    "summary": truncate_text(item["summary"], 160),
+                    "updated_at": item["updated_at"],
+                }
+                for item in memories
+            ],
+        },
+    )
+
+
+# 轮级 metrics 中 llm_usage 的固定键，与 OpenAIChatClient.usage_totals 保持一致。
+LLM_USAGE_KEYS = ("calls", "input_tokens", "output_tokens", "total_tokens")
+
+
+def elapsed_ms(started_at: float) -> int:
+    """
+    计算从 started_at（perf_counter 时刻）到现在的毫秒数，负值截断为 0。
+    """
+
+    return max(0, int((time.perf_counter() - started_at) * 1000))
+
+
+def build_stage_metric(stage: str, started_at: float, status: str) -> dict[str, Any]:
+    """
+    构造单个阶段的耗时指标。
+
+    Args:
+        stage: 阶段名，与 legal_step 步骤名保持一致。
+        started_at: 阶段开始的 perf_counter 时刻。
+        status: ok（正常）、degraded（降级继续）或 retried（自动重试后成功）。
+    """
+
+    return {"stage": stage, "duration_ms": elapsed_ms(started_at), "status": status}
+
+
+def snapshot_llm_usage(source: Any) -> dict[str, int] | None:
+    """
+    从 usage 来源对象读取累计 usage 快照。
+
+    Args:
+        source: 通常是共享的 OpenAIChatClient。兼容两种形态：提供 snapshot_usage_totals()
+            方法，或直接暴露 usage_totals 字典；两者都没有（如部分测试 fake）时返回 None，
+            metrics 中的 usage 按零值处理。
+    """
+
+    if source is None:
+        return None
+    snapshot = getattr(source, "snapshot_usage_totals", None)
+    data = snapshot() if callable(snapshot) else getattr(source, "usage_totals", None)
+    if not isinstance(data, dict):
+        return None
+    result: dict[str, int] = {}
+    for key in LLM_USAGE_KEYS:
+        try:
+            result[key] = max(0, int(data.get(key) or 0))
+        except (TypeError, ValueError):
+            result[key] = 0
+    return result
+
+
+def diff_llm_usage(before: dict[str, int] | None, after: dict[str, int] | None) -> dict[str, int]:
+    """
+    计算轮前后两次 usage 快照的增量；无法取到快照时返回零值。
+    """
+
+    if after is None:
+        return {key: 0 for key in LLM_USAGE_KEYS}
+    before = before or {}
+    return {key: max(0, int(after.get(key) or 0) - int(before.get(key) or 0)) for key in LLM_USAGE_KEYS}
+
+
+def build_turn_metrics_event(
+    *,
+    stages: list[dict[str, Any]],
+    turn_started_at: float,
+    usage_before: dict[str, int] | None,
+    usage_source: Any,
+    events: list[AgentEvent],
+) -> AgentEvent:
+    """
+    构造轮级可观测性事件。
+
+    Args:
+        stages: 各阶段耗时与状态列表。
+        turn_started_at: 整轮开始的 perf_counter 时刻。
+        usage_before: 轮开始时的 usage 快照。
+        usage_source: usage 来源对象，用于取轮结束快照做差。
+        events: 本轮已记录事件，用于统计 selfheal 次数。
+
+    Why:
+        metrics 作为普通 AgentEvent 发出而不是单独返回值：CLI、Web 和测试都已经消费事件流，
+        观测数据走同一条通道就能同时覆盖实时展示、NDJSON 推送和 events.jsonl 持久化。
+    """
+
+    return AgentEvent(
+        type="legal_turn_metrics",
+        data={
+            "stages": [dict(item) for item in stages],
+            "total_duration_ms": elapsed_ms(turn_started_at),
+            "llm_usage": diff_llm_usage(usage_before, snapshot_llm_usage(usage_source)),
+            "selfheal_count": sum(1 for event in events if event.type == "legal_selfheal"),
+        },
+    )
+
+
+def build_selfheal_event(*, stage: str, action: str, detail: str) -> AgentEvent:
+    """
+    构造链路自修复事件。
+
+    Args:
+        stage: 发生自修复的环节名，与 legal_step 的步骤名保持一致。
+        action: retried（该环节已自动重试）或 degraded（该环节失败，以降级产物继续）。
+        detail: 原始错误摘要。只进入内部事件列表供 CLI 和测试排查；Web 白名单会剥掉它，
+            避免把异常内文透传到浏览器。
+    """
+
+    return AgentEvent(
+        type="legal_selfheal",
+        data={
+            "stage": stage,
+            "action": action,
+            "detail": truncate_text(str(detail or ""), 300),
+        },
+    )
+
+
+def build_degraded_rag_result(error: Exception | None = None) -> LegalCaseRagResult:
+    """
+    构造检索失败时的空降级 RAG 结果。
+
+    Args:
+        error: 触发降级的异常；为 None 时返回纯空占位（供兼容路径复用）。
+
+    Returns:
+        LegalCaseRagResult: 空计划、空证据的合法结果对象，可直接进入后续分析与回答链路。
+    """
+
+    warnings: list[str] = []
+    if error is not None:
+        warnings.append(f"案情拆解与法条检索失败，本轮无本地法条证据：{truncate_text(str(error), 160)}")
+    return LegalCaseRagResult(
+        query_plan=LegalQueryPlan(global_queries=[], issues=[], warnings=[]),
+        issue_results=[],
+        evidences=[],
+        warnings=warnings,
+    )
 
 
 def record_event(
@@ -1150,10 +1525,7 @@ def events_to_empty_rag_placeholder() -> Any:
     而不是让 session 保存上一轮所有内部对象。
     """
 
-    from agent_system.planning.legal_query_planner import LegalQueryPlan
-    from agent_system.legal_consultation.models import LegalCaseRagResult
-
-    return LegalCaseRagResult(query_plan=LegalQueryPlan(global_queries=[], issues=[], warnings=[]), issue_results=[], evidences=[])
+    return build_degraded_rag_result()
 
 
 __all__ = [

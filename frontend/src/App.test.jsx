@@ -97,6 +97,71 @@ describe('App 补充信息交互', () => {
     expect(screen.queryByText('根据劳动合同法第八十二条分析如下。')).not.toBeInTheDocument();
   });
 
+  test('提交补充后新一轮进行中再次出现补充建议时，弹窗仍可输入和关闭', async () => {
+    const user = userEvent.setup();
+    const secondStreamDone = createDeferred();
+
+    openChatStream
+      .mockResolvedValueOnce({ id: 'pause-stream' })
+      .mockResolvedValueOnce({ id: 'second-round-stream' });
+
+    readNdjsonStream.mockImplementation(async (body, onItem) => {
+      if (body.id === 'pause-stream') {
+        // 第一轮：后端要求先补充关键信息，pause 后本轮流式响应立即结束。
+        onItem({
+          type: 'pause',
+          message: '请先补充关键信息。',
+          questions: ['劳动合同是什么时间开始没有签的？'],
+          evidence_gaps: [],
+        });
+        onItem({ type: 'done' });
+        return;
+      }
+
+      // 第二轮：补充提交后 agent 继续执行完整链路，中途又给出新的补充建议，
+      // 然后用 deferred 卡住模拟耗时的检索和流式回答阶段。
+      onItem({
+        type: 'event',
+        event_type: 'legal_missing_details_suggested',
+        title: '建议补充',
+        data: {
+          message: '还可以补充这些信息。',
+          questions: ['是否有工资流水？'],
+          evidence_gaps: [],
+        },
+      });
+      await secondStreamDone.promise;
+      onItem({ type: 'final', answer: '第二轮答复' });
+      onItem({ type: 'done' });
+    });
+
+    render(<App />);
+
+    await user.type(screen.getByRole('textbox', { name: '案情或追问' }), '公司一直不签劳动合同');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+
+    // 第一轮 pause 弹窗自动打开；此时流已结束，提交走“立即发起新一轮”分支。
+    await screen.findByRole('dialog', { name: /请先补充关键信息/ });
+    await user.type(screen.getByRole('textbox', { name: '其他补充说明' }), '我从 2024 年 1 月入职。');
+    await user.click(screen.getByRole('button', { name: '提交补充并继续' }));
+    await waitFor(() => expect(openChatStream).toHaveBeenCalledTimes(2));
+
+    // 第二轮仍在进行：上一次提交的 submitting 状态不能残留到整轮结束，
+    // 否则新弹窗会被禁用成“既不能输入也关不掉”。
+    await user.click(await screen.findByRole('button', { name: '逐条补充' }));
+    const freeTextInput = screen.getByRole('textbox', { name: '其他补充说明' });
+    expect(freeTextInput).toBeEnabled();
+    await user.type(freeTextInput, '有银行工资流水。');
+    expect(freeTextInput).toHaveValue('有银行工资流水。');
+
+    expect(screen.getByRole('button', { name: '关闭补充信息弹窗' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: '关闭补充信息弹窗' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /补充关键信息/ })).not.toBeInTheDocument());
+
+    secondStreamDone.resolve();
+    await screen.findByText('第二轮答复');
+  });
+
   test('当前回答尚未结束时提交补充内容，应先在前端排队而不是并发请求后端', async () => {
     const user = userEvent.setup();
     const firstStreamDone = createDeferred();

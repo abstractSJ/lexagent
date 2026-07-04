@@ -195,5 +195,83 @@ class OpenAIChatClientTests(unittest.TestCase):
         self.assertEqual("你是助手。", request["instructions"])
 
 
+class UsageTotalsTests(unittest.TestCase):
+    """
+    测试客户端进程内 usage 累计：为可观测性提供每次调用的 token 与调用次数计数。
+    """
+
+    def build_client(self) -> tuple[OpenAIChatClient, MagicMock]:
+        """
+        创建不发真实请求的测试客户端。
+        """
+
+        config = LLMConfig(
+            api_key="test-key",
+            model="default-model",
+            base_url="http://example.com/v1",
+            temperature=0.7,
+            reasoning_effort=None,
+            timeout=12.0,
+            max_tokens=None,
+        )
+        client = OpenAIChatClient(config=config)
+        create_mock = MagicMock()
+        client.client = SimpleNamespace(responses=SimpleNamespace(create=create_mock))
+        return client, create_mock
+
+    def test_chat_accumulates_usage_from_completed_event(self) -> None:
+        """
+        流式调用应从 response.completed 事件提取 usage 并累计。
+        """
+
+        client, create_mock = self.build_client()
+        create_mock.return_value = [
+            {"type": "response.output_text.delta", "delta": "法"},
+            {"type": "response.completed", "response": {"usage": {"input_tokens": 100, "output_tokens": 20}}},
+        ]
+
+        list(client.chat([{"role": "user", "content": "你好"}]))
+
+        totals = client.snapshot_usage_totals()
+        self.assertEqual(1, totals["calls"])
+        self.assertEqual(100, totals["input_tokens"])
+        self.assertEqual(20, totals["output_tokens"])
+        self.assertEqual(120, totals["total_tokens"])
+
+    def test_chat_counts_call_even_without_usage_event(self) -> None:
+        """
+        兼容服务可能不回传 usage：调用次数仍要计数，token 保持不变。
+        """
+
+        client, create_mock = self.build_client()
+        create_mock.return_value = [{"type": "response.output_text.delta", "delta": "x"}]
+
+        list(client.chat([{"role": "user", "content": "你好"}]))
+
+        totals = client.snapshot_usage_totals()
+        self.assertEqual(1, totals["calls"])
+        self.assertEqual(0, totals["total_tokens"])
+
+    def test_create_response_accumulates_usage(self) -> None:
+        """
+        非流式 create_response 应直接读取 response.usage 并累计多次调用。
+        """
+
+        client, create_mock = self.build_client()
+        create_mock.return_value = SimpleNamespace(
+            usage=SimpleNamespace(input_tokens=50, output_tokens=10),
+            output_text="ok",
+        )
+
+        client.create_response(input=[{"role": "user", "content": [{"type": "input_text", "text": "你好"}]}])
+        client.create_response(input=[{"role": "user", "content": [{"type": "input_text", "text": "你好"}]}])
+
+        totals = client.snapshot_usage_totals()
+        self.assertEqual(2, totals["calls"])
+        self.assertEqual(100, totals["input_tokens"])
+        self.assertEqual(20, totals["output_tokens"])
+        self.assertEqual(120, totals["total_tokens"])
+
+
 if __name__ == "__main__":
     unittest.main()

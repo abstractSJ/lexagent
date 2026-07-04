@@ -674,10 +674,17 @@ export default function App() {
       setSupplementBlocking(false);
       setSupplementDialogOpen(false);
       try {
-        const succeeded = await sendChatRequest(payload, {
+        const requestPromise = sendChatRequest(payload, {
           displayUserText,
           clearEventLog: true,
         });
+        // sendChatRequest 的同步段已把 requestActiveRef 置为 true，且本弹窗对应的 supplement
+        // 已被清空：此后再触发提交只会命中上方“暂存等待本轮结束”分支，双击保护不再依赖
+        // submitting 锁。这里必须立即释放锁，而不是等整轮流式响应结束——本轮中途如果后端
+        // 又给出新的补充建议，残留的 submitting 会把新弹窗的输入框和关闭按钮一起禁用到本轮
+        // 结束，用户会遇到“弹窗打开后既不能输入也关不掉”的卡死体验。
+        updateSupplementSubmitting(false);
+        const succeeded = await requestPromise;
         if (!succeeded) {
           setSupplement(previousSupplement);
           setSupplementBlocking(previousBlocking);
