@@ -105,7 +105,7 @@ data/                       法条原始数据、Chroma 持久化目录、会话
 - `BOCHA_WEB_SEARCH_SUMMARY`
 - `BOCHA_WEB_SEARCH_FRESHNESS`
 
-注意：本项目已用 git 管理。真实 API key 不进 git：放环境变量，或放 `agent_system/config_local.py`（已被 `.gitignore` 排除，模板 `agent_system/config_local.example.py`），读取优先级为环境变量 > config_local > 内置默认值。`data/chroma/`、`data/sessions/`、`data/memory/`、`web_app/static/`、`node_modules/` 不入库。BGE-M3 首次运行可能下载模型；CUDA 不稳可切 CPU。
+注意：本项目已用 git 管理。真实 API key 不进 git：放环境变量，或放 `agent_system/config_local.py`（已被 `.gitignore` 排除，模板 `agent_system/config_local.example.py`），读取优先级为环境变量 > config_local > 内置默认值。`data/chroma/`、`data/sessions/`、`data/memory/`、`web_app/static/`、`node_modules/` 不入库。BGE-M3 首次运行可能下载模型；embedding 默认使用 CPU，确认 CUDA 环境稳定后可设 `LEGAL_EMBEDDING_DEVICE=cuda`。
 
 ## LLM 层
 

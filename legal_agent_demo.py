@@ -17,6 +17,7 @@ import json
 import os
 
 from agent_system.agent import AgentEvent, create_agent_session
+from agent_system.config import load_embedding_config
 from agent_system.legal_consultation import create_legal_consultation_session
 
 
@@ -127,9 +128,16 @@ def main() -> None:
         print("法律咨询 Agent 已启动（legacy 工具循环模式）。输入 exit 或 quit 退出。")
     else:
         session = create_legal_consultation_session()
+        embedding_device = load_embedding_config().device or "auto"
         print("法律咨询 Agent 已启动（多轮案件调研链路）。输入 exit 或 quit 退出。")
+        # 启动时直接展示 embedding 设备。原因是 BGE-M3 首次加载可能较慢，用户需要明确知道
+        # 当前慢启动来自 CPU 稳定模式还是显式开启的 CUDA 模式。
+        print(f"Embedding 设备：{embedding_device}", flush=True)
         if os.getenv("LEGAL_RAG_PRELOAD", "1").strip() not in {"0", "false", "no", "否"}:
-            print("正在预热本地法条 RAG（BGE-M3、Chroma、关键词索引）...", flush=True)
+            print(
+                f"正在预热本地法条 RAG（Embedding 设备：{embedding_device}；BGE-M3、Chroma、关键词索引）...",
+                flush=True,
+            )
             session.preload_resources()
             print("本地法条 RAG 预热完成。", flush=True)
     if use_legacy_agent:

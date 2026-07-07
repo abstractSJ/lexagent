@@ -97,6 +97,26 @@ class MainEntryTests(unittest.TestCase):
             reload=False,
         )
 
+    def test_run_web_server_prints_embedding_device(self) -> None:
+        """
+        Web UI 启动时应展示当前 embedding 设备，方便用户判断本地 RAG 预热将使用 CPU 还是 CUDA。
+        """
+
+        args = SimpleNamespace(host="127.0.0.1", port=8765, reload=False, no_browser=True)
+
+        with (
+            patch("uvicorn.run"),
+            patch("webbrowser.open"),
+            patch("builtins.print") as mocked_print,
+        ):
+            main.run_web_server(args)
+
+        printed_lines = [" ".join(str(part) for part in call.args) for call in mocked_print.call_args_list]
+        self.assertTrue(
+            any("Embedding 设备：cpu" in line for line in printed_lines),
+            f"Web 启动输出未展示 embedding 设备，实际输出：{printed_lines}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

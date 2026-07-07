@@ -12,6 +12,7 @@ from argparse import ArgumentParser, Namespace
 from collections.abc import Sequence
 import webbrowser
 
+from agent_system.config import load_embedding_config
 from agent_system.llm import create_chat_session
 
 
@@ -95,8 +96,11 @@ def run_web_server(args: Namespace) -> None:
     import uvicorn
 
     url = build_web_url(args.host, args.port)
+    embedding_device = load_embedding_config().device or "auto"
     print("法律咨询 Web UI 正在启动。")
     print(f"访问地址：{url}")
+    # Web UI 会在后续预热/检索阶段加载本地 BGE-M3；启动时展示设备，方便用户判断慢启动来源。
+    print(f"Embedding 设备：{embedding_device}")
     print("关闭窗口或按 Ctrl+C 可停止服务。")
 
     if not args.no_browser:

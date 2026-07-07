@@ -272,7 +272,10 @@ LLM_CONFIG = LLMConfig(
 EMBEDDING_CONFIG = EmbeddingConfig(
     provider="local",
     model_name=os.getenv("LEGAL_EMBEDDING_MODEL", "BAAI/bge-m3"),
-    device=os.getenv("LEGAL_EMBEDDING_DEVICE", "cuda") or None,
+    # 默认使用 CPU。原因是本项目常在 Windows 本机学习环境运行，CUDA 驱动、显存和 PyTorch
+    # 版本不匹配时容易导致启动卡顿、失败甚至系统不稳定；确认环境稳定后可显式设置
+    # LEGAL_EMBEDDING_DEVICE=cuda 启用 GPU。
+    device=(os.getenv("LEGAL_EMBEDDING_DEVICE") or "cpu").strip() or "cpu",
     batch_size=8,
     torch_num_threads=4,
     normalize_embeddings=True,

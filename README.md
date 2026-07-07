@@ -66,7 +66,7 @@ cp agent_system/config_local.example.py agent_system/config_local.py
 
 ### 3. 构建法条向量库
 
-首次运行会下载 BGE-M3 模型；CUDA 不稳定可设 `LEGAL_EMBEDDING_DEVICE=cpu`。
+首次运行会下载 BGE-M3 模型；embedding 默认使用 CPU。确认 CUDA 环境稳定后，可设 `LEGAL_EMBEDDING_DEVICE=cuda` 加速。
 
 ```bash
 python scripts/build_legal_chroma.py
