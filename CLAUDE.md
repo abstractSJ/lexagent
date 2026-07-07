@@ -222,7 +222,7 @@ legal_agent_demo.py
 - 内部子调用的原始 prompt/response 不写入主会话 `history()`。
 - `LegalConsultationSession.history()` 只保存公开 system/user/assistant。
 - 子任务结果通过 `AgentEvent` 暴露，如 `legal_step`、`legal_selfheal`、`legal_memory_recalled`、`legal_rag_query_started`、`case_state_updated`、`legal_missing_details_suggested`、`legal_supplement_required`、`legal_case_rag_done`、`legal_web_search_started/done`、`legal_reference_materials`、`legal_next_action_decided`、`legal_turn_metrics`、`answer_delta`。
-- “案情拆解 + 多 query RAG”是一个子任务，复用已有 query planner 和 retriever；planner 串行执行，后续多 query/关键词检索可并发 fan-out。
+- “案情拆解 + 多 query RAG”是一个子任务，复用已有 query planner 和 retriever；planner 串行执行，后续多 query/关键词检索可并发 fan-out；语义检索和关键词兜底都按 planner 推荐的法律名上限展开，避免关键词只搜第一部法律造成跨法域漏召回。
 - 法条证据用融合分数重排（`evidence_rank_score`）：检索分数为主体，多 query 重复命中和 planner 的 positive_terms 小幅加分、negative_terms 小幅减分；语义检索每条 query 前两名保底，其余低于 0.30 的长尾剔除。不要改回 hit_count 绝对优先的排序。
 - 风险识别、案情目录和下一步动作由 `LegalCaseAnalyzer` 一次 LLM 调用合并产出（一轮成功链路共 4 次 LLM 调用：状态更新、query 规划、综合分析、最终回答）；不要拆回三次串行调用。
 - 确定性公网检索复用 `web_search` 工具，在案件状态更新后立即后台启动（早于 RAG，rag 等参数传 None），与本地检索和综合分析全程并行；三条固定 query 分别面向相似案例、司法解释/权威规定和裁判规则/实务口径，司法解释 query 用 include 限定官方与专业法律站点，其余 query 用 exclude 排除低质站点；每条 query 取 10 条候选、按权威度重排后保留 5 条，`LegalWebSearchItem.authority_level` 进入最终 prompt 和资料栏（权威/专业/低置信标识）；结果进入最终临时 runtime input，并通过 `legal_reference_materials` 的安全白名单字段进入右侧参考资料栏，不写入公开 history；Web 进度区只展示脱敏计数。

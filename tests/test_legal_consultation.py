@@ -448,6 +448,40 @@ class LegalCaseRagSubtaskTests(unittest.TestCase):
         self.assertGreater(first.hit_count, 1)
         self.assertIn("planner warning", result.warnings)
 
+    def test_keyword_fallback_fans_out_to_multiple_preferred_legal_names(self) -> None:
+        """
+        关键词兜底应覆盖 planner 推荐的多部法律，避免只检索第一部法律导致跨法域条文漏召回。
+        """
+
+        plan = LegalQueryPlan(
+            global_queries=["劳动争议 社保 仲裁"],
+            issues=[
+                LegalIssueQuery(
+                    issue="未签合同、社保与仲裁程序的综合处理",
+                    facts=["公司未签合同", "公司未缴社保"],
+                    preferred_legal_names=["劳动合同法", "社会保险法", "劳动争议调解仲裁法"],
+                    queries=["未签劳动合同 未缴社保 劳动仲裁"],
+                    positive_terms=["未签", "社保", "仲裁"],
+                    negative_terms=[],
+                )
+            ],
+            warnings=[],
+        )
+        retriever = FakeRetriever()
+        subtask = LegalCaseRagSubtask(planner=FakePlanner(plan), retriever=retriever, retrieval_workers=1)
+
+        subtask.run(
+            case_text="公司没签合同，也没交社保，我要仲裁。",
+            state=LegalCaseState(summary="未签合同、未缴社保和劳动仲裁"),
+        )
+
+        # 关键词兜底沿用检索任务的法律名上限，避免复杂案情下 job 数量失控；关键是不能只取第一个。
+        self.assertEqual(
+            ["劳动合同法", "社会保险法"],
+            [call["legal_name"] for call in retriever.keyword_calls],
+        )
+        self.assertTrue(all(call["keywords"] == ["未签", "社保", "仲裁"] for call in retriever.keyword_calls))
+
     def test_rag_collects_retrieval_warnings(self) -> None:
         """
         单条检索失败时，子任务应保留 warning 并继续合并其他可用证据。

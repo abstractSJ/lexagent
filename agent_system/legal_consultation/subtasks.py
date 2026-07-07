@@ -665,17 +665,20 @@ class LegalCaseRagSubtask:
             issue_keywords = list(issue.positive_terms)
             used_keywords_by_issue[issue_index] = issue_keywords
             if issue_keywords:
-                jobs.append(
-                    RetrievalJob(
-                        index=len(jobs),
-                        issue_index=issue_index,
-                        issue_title=issue.issue,
-                        retrieval_type="keyword",
-                        query=" ".join(issue_keywords),
-                        legal_name=legal_names[0] if legal_names and legal_names[0] else "",
-                        keywords=issue_keywords,
+                for legal_name in legal_names:
+                    # 关键词兜底也按 planner 推荐的多部法律 fan-out。原因是跨法域案情中，语义检索
+                    # 可能漏掉短法条或低分长尾；如果关键词只锁定第一部法律，会削弱兜底召回能力。
+                    jobs.append(
+                        RetrievalJob(
+                            index=len(jobs),
+                            issue_index=issue_index,
+                            issue_title=issue.issue,
+                            retrieval_type="keyword",
+                            query=" ".join(issue_keywords),
+                            legal_name=legal_name,
+                            keywords=issue_keywords,
+                        )
                     )
-                )
         return jobs, used_queries_by_issue, used_keywords_by_issue
 
     def _emit_retrieval_batch_started(
