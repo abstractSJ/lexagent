@@ -1,5 +1,6 @@
 import { memo, useState } from 'react';
-import { Box, Button, Stack, TextField, Typography } from '@mui/material';
+import { Box, Button, CircularProgress, Stack, TextField, Typography } from '@mui/material';
+import { SendIcon } from '../icons.jsx';
 
 /**
  * 聊天输入框。
@@ -50,10 +51,10 @@ const ChatInput = memo(function ChatInput({ disabled, isSending, onSubmit }) {
       sx={{
         display: 'grid',
         gap: 1.25,
-        p: { xs: 2, md: 2.5 },
+        p: { xs: 1.75, md: 2 },
         borderTop: '1px solid',
         borderColor: 'divider',
-        backgroundColor: 'rgba(248, 250, 252, 0.92)',
+        background: 'linear-gradient(180deg, #fafbff 0%, #f4f7fd 100%)',
       }}
     >
       <TextField
@@ -63,20 +64,39 @@ const ChatInput = memo(function ChatInput({ disabled, isSending, onSubmit }) {
         onKeyDown={handleKeyDown}
         disabled={disabled}
         multiline
-        minRows={4}
+        minRows={3}
         maxRows={8}
         placeholder="例如：我在公司干了两年，没有签劳动合同，现在被辞退了，公司也没给补偿。"
         slotProps={{ htmlInput: { 'aria-label': '案情或追问' } }}
       />
       <Stack
-        direction={{ xs: 'column', sm: 'row' }}
+        direction="row"
         spacing={1.5}
-        sx={{ alignItems: { xs: 'stretch', sm: 'center' }, justifyContent: 'space-between' }}
+        useFlexGap
+        sx={{ alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}
       >
-        <Typography color="text.secondary" sx={{ fontSize: 12 }}>
-          Enter 发送，Shift + Enter 换行，Ctrl/Cmd + Enter 也可发送。
-        </Typography>
-        <Button type="submit" variant="contained" disabled={disabled || !text.trim()} sx={{ minWidth: 96, minHeight: 40 }}>
+        <Stack
+          direction="row"
+          spacing={0.75}
+          sx={{ alignItems: 'center', color: 'text.secondary', display: { xs: 'none', sm: 'flex' } }}
+        >
+          <Kbd>Enter</Kbd>
+          <HintText>发送</HintText>
+          <HintText>·</HintText>
+          <Kbd>Shift+Enter</Kbd>
+          <HintText>换行</HintText>
+          <HintText>·</HintText>
+          <Kbd>Ctrl/⌘+Enter</Kbd>
+          <HintText>发送</HintText>
+        </Stack>
+        <Button
+          type="submit"
+          variant="contained"
+          disabled={disabled || !text.trim()}
+          startIcon={isSending ? <CircularProgress size={14} color="inherit" /> : null}
+          endIcon={isSending ? null : <SendIcon sx={{ fontSize: 15 }} />}
+          sx={{ minWidth: 108, minHeight: 42, borderRadius: '12px', px: 2.25, ml: 'auto' }}
+        >
           {isSending ? '处理中' : '发送'}
         </Button>
       </Stack>
@@ -85,3 +105,45 @@ const ChatInput = memo(function ChatInput({ disabled, isSending, onSubmit }) {
 });
 
 export default ChatInput;
+
+/**
+ * 键位提示胶囊。
+ *
+ * 把纯文字快捷键说明拆成 kbd 小块 + 说明词，扫一眼即可分清"哪个是按键、哪个是效果"。
+ *
+ * @param {object} props 组件参数。
+ * @param {React.ReactNode} props.children 按键文本。
+ * @returns {JSX.Element} 键位胶囊。
+ */
+function Kbd({ children }) {
+  return (
+    <Box
+      component="kbd"
+      sx={{
+        px: 0.6,
+        py: 0.1,
+        borderRadius: '6px',
+        border: '1px solid #d5ddee',
+        backgroundColor: '#ffffff',
+        boxShadow: '0 1px 0 #d5ddee',
+        fontSize: 11,
+        fontFamily: 'inherit',
+        lineHeight: 1.6,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {children}
+    </Box>
+  );
+}
+
+/**
+ * 键位提示的说明文字。
+ *
+ * @param {object} props 组件参数。
+ * @param {React.ReactNode} props.children 说明词。
+ * @returns {JSX.Element} 说明文字。
+ */
+function HintText({ children }) {
+  return <Typography sx={{ fontSize: 12, whiteSpace: 'nowrap' }}>{children}</Typography>;
+}

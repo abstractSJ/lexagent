@@ -266,6 +266,54 @@ describe('App 补充信息交互', () => {
     );
   });
 
+  test('阻塞补充弹窗点击“无法补充，直接分析”后跳过补充继续完整分析', async () => {
+    const user = userEvent.setup();
+
+    openChatStream
+      .mockResolvedValueOnce({ id: 'pause-stream' })
+      .mockResolvedValueOnce({ id: 'skip-stream' });
+
+    readNdjsonStream.mockImplementation(async (body, onItem) => {
+      if (body.id === 'pause-stream') {
+        onItem({
+          type: 'pause',
+          message: '请先补充关键信息。',
+          questions: ['劳动合同是什么时间开始没有签的？'],
+          evidence_gaps: [],
+        });
+        onItem({ type: 'done' });
+        return;
+      }
+
+      onItem({
+        type: 'event',
+        event_type: 'legal_supplement_skipped',
+        title: '已按现有信息继续分析',
+        data: { status: 'continued' },
+      });
+      onItem({ type: 'final', answer: '已基于现有信息给出阶段性答复' });
+      onItem({ type: 'done' });
+    });
+
+    render(<App />);
+
+    await user.type(screen.getByRole('textbox', { name: '案情或追问' }), '公司一直不签劳动合同');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+
+    await screen.findByRole('dialog', { name: /请先补充关键信息/ });
+    await user.click(screen.getByRole('button', { name: '无法补充，直接分析' }));
+
+    await waitFor(() => expect(openChatStream).toHaveBeenCalledTimes(2));
+    expect(openChatStream).toHaveBeenLastCalledWith(
+      expect.objectContaining({ skip_supplement: true }),
+    );
+    // 聊天区展示明确的“无法补充”声明，随后收到基于现有信息的最终答复。
+    await screen.findByText('我暂时无法补充这些信息，请基于现有信息继续分析。');
+    await screen.findByText('已基于现有信息给出阶段性答复');
+    // 跳过后阻塞状态解除，主输入恢复可用。
+    await waitFor(() => expect(screen.getByRole('textbox', { name: '案情或追问' })).toBeEnabled());
+  });
+
   test('排队补充自动提交失败后，应恢复原补充弹窗和已填写内容', async () => {
     const user = userEvent.setup();
     const firstStreamDone = createDeferred();

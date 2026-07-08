@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>法律咨询 Agent · 项目架构图</title>
+<!--
+  项目架构图（自包含单文件，无外部依赖，浏览器直接打开即可查看）。
+
+  为什么用纯 HTML/CSS 而不是 Mermaid/draw.io：
+  1. 不依赖任何插件或在线服务，离线双击即开；
+  2. 分层架构 + 并行泳道这种版式，手工布局比自动布局工具更可控、更易读；
+  3. 配色与前端 theme.js 的品牌体系（深海军蓝 + 金色）保持一致，视觉上和项目 Web UI 同源。
+
+  内容分三部分：
+  图 1 系统分层架构（入口 → Web → 业务编排 → 通用能力 → 数据与外部服务）
+  图 2 一轮咨询执行流程（4 次 LLM 调用 + 后台并行公网检索 + 暂停补充旁路）
+  图 3 持久化与观测（会话存档 / 跨会话记忆 / 轮级指标）
+-->
+<style>
+  /* ========== 基础与品牌 token（与 frontend/src/theme.js 同源的色值） ========== */
+  :root {
+    --navy-deep: #16295f;
+    --navy: #1e3a8a;
+    --brand: #2b4ecb;
+    --brand-soft-bg: #e8edfb;
+    --purple: #5b52d6;
+    --purple-soft-bg: #f0edfd;
+    --gold: #b7791f;
+    --gold-soft-bg: #fdf3e3;
+    --green: #0f8a5f;
+    --green-soft-bg: #e6f6f2;
+    --amber-border: #f0dcae;
+    --amber-bg: #fdf7e7;
+    --ink: #152036;
+    --ink-2: #3c4a66;
+    --ink-3: #5c6a84;
+    --line: #e3e8f3;
+    --panel-bg: #ffffff;
+    --page-bg: #eef2f9;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    color: var(--ink);
+    /* 三层径向光晕 + 浅灰蓝底，与 Web UI 全局背景一致，避免大面积纯白刺眼 */
+    background:
+      radial-gradient(900px 480px at 8% -10%, rgba(43, 78, 203, 0.10), transparent 60%),
+      radial-gradient(800px 420px at 96% 0%, rgba(183, 121, 31, 0.08), transparent 55%),
+      var(--page-bg);
+    line-height: 1.6;
+  }
+  code, .code, .evt {
+    font-family: Consolas, "JetBrains Mono", "Courier New", monospace;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 24px 60px; }
+
+  /* ========== 顶部 Hero ========== */
+  .hero {
+    position: relative;
+    overflow: hidden;
+    border-radius: 20px;
+    padding: 30px 34px;
+    color: #fff;
+    background: linear-gradient(135deg, #16295f 0%, #1e3a8a 45%, #3a53c5 100%);
+    box-shadow: 0 24px 60px -20px rgba(15, 26, 62, 0.45);
+  }
+  /* 右上角装饰光晕：只做氛围，不承载信息 */
+  .hero::after {
+    content: "";
+    position: absolute;
+    right: -80px; top: -120px;
+    width: 340px; height: 340px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(242, 199, 109, 0.28), transparent 65%);
+    pointer-events: none;
+  }
+  .hero .eyebrow {
+    margin: 0 0 6px;
+    font-size: 12px;
+    letter-spacing: 3px;
+    color: #f2c76d;
+    font-weight: 700;
+  }
+  .hero h1 { margin: 0; font-size: 26px; letter-spacing: 1px; }
+  .hero .sub { margin: 10px 0 0; font-size: 14px; color: rgba(255, 255, 255, 0.82); max-width: 860px; }
+  .hero .tech { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .hero .tech span {
+    font-size: 12px;
+    padding: 3px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    background: rgba(255, 255, 255, 0.10);
+    color: rgba(255, 255, 255, 0.92);
+  }
+  .hero .emblem {
+    position: absolute;
+    right: 30px; bottom: -26px;
+    font-size: 150px;
+    opacity: 0.10;
+    transform: rotate(-12deg);
+    pointer-events: none;
+    user-select: none;
+  }
+
+  /* ========== 章节标题 ========== */
+  .section-title {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin: 42px 0 16px;
+  }
+  .section-title .no {
+    font-size: 13px;
+    font-weight: 800;
+    color: var(--gold);
+    letter-spacing: 2px;
+  }
+  .section-title h2 {
+    margin: 0;
+    font-size: 19px;
+    color: var(--ink);
+    border-left: 4px solid var(--brand);
+    padding-left: 12px;
+  }
+  .section-title .hint { font-size: 12.5px; color: var(--ink-3); }
+
+  /* ========== 分层架构 ========== */
+  .layer {
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: rgba(255, 255, 255, 0.66);
+    padding: 16px 18px 18px;
+  }
+  .layer-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .layer-head .dot { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+  .layer-head .name { font-size: 15px; font-weight: 800; color: var(--ink); }
+  .layer-head .path { font-size: 12px; color: var(--ink-3); }
+  .layer-body {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--panel-bg);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 12px 14px;
+    box-shadow: 0 6px 18px -12px rgba(21, 32, 54, 0.25);
+  }
+  .card h3 { margin: 0 0 6px; font-size: 13.5px; color: var(--ink); }
+  .card p, .card li { margin: 0; font-size: 12.5px; color: var(--ink-2); }
+  .card ul { margin: 4px 0 0; padding-left: 16px; }
+  .card li { margin-bottom: 3px; }
+  .card li:last-child { margin-bottom: 0; }
+
+  /* 文件/模块名芯片（蓝）与事件名芯片（紫），颜色语义与 Web UI 进度区一致 */
+  .code {
+    font-size: 11.5px;
+    background: var(--brand-soft-bg);
+    color: var(--brand);
+    padding: 0 6px;
+    border-radius: 6px;
+    white-space: nowrap;
+  }
+  .evt {
+    font-size: 11.5px;
+    background: var(--purple-soft-bg);
+    color: var(--purple);
+    padding: 0 6px;
+    border-radius: 6px;
+    white-space: nowrap;
+  }
+
+  /* 层与层之间的向下箭头连接线 */
+  .layer-arrow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 6px 0;
+  }
+  .layer-arrow .line { width: 2px; height: 14px; background: #93a3c4; border-radius: 1px; }
+  .layer-arrow .tri {
+    width: 0; height: 0;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-top: 8px solid #93a3c4;
+  }
+  .layer-arrow .label { font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+
+  /* Web 层内部：前端 ⇄ 后端 双卡 + 中间协议标注 */
+  .duo {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: 12px;
+    align-items: stretch;
+  }
+  .duo .link {
+    align-self: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    min-width: 120px;
+  }
+  .duo .link .proto {
+    font-size: 11.5px;
+    color: var(--brand);
+    background: var(--brand-soft-bg);
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+  .duo .link .arrows { font-size: 16px; color: #93a3c4; letter-spacing: 2px; }
+
+  /* 层内横向补充说明条（如自修复机制），弱化为浅底长条避免抢卡片视觉 */
+  .layer-note {
+    margin-top: 12px;
+    border: 1px dashed #c9d4ea;
+    background: #f6f8fd;
+    border-radius: 12px;
+    padding: 8px 14px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+
+  /* ========== 一轮咨询执行流程（主链路 + 右侧并行/旁路泳道） ========== */
+  .flow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 330px;
+    column-gap: 20px;
+    align-items: stretch;
+  }
+  .step { border-radius: 14px; border: 1px solid var(--line); background: var(--panel-bg); padding: 12px 16px; box-shadow: 0 6px 18px -12px rgba(21, 32, 54, 0.25); }
+  .step-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .step-no {
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    font-size: 13px;
+    font-weight: 800;
+    color: #fff;
+    flex-shrink: 0;
+    background: #8592ab;
+  }
+  /* LLM 调用节点用金色渐变圆徽突出：一眼数出一轮共 4 次模型调用 */
+  .step-no.llm { background: linear-gradient(135deg, #f2c76d 0%, #d89a2e 55%, #b7791f 100%); color: #4a3204; }
+  .step-title { font-size: 14px; font-weight: 800; color: var(--ink); }
+  .tag {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 700;
+    border-radius: 999px;
+    padding: 1px 10px;
+    white-space: nowrap;
+  }
+  .tag-llm { background: var(--gold-soft-bg); color: var(--gold); border: 1px solid var(--amber-border); }
+  .tag-local { background: #edf1f8; color: var(--ink-3); border: 1px solid var(--line); }
+  .tag-stream { background: var(--green-soft-bg); color: var(--green); border: 1px solid #c2e5d2; }
+  .step p { margin: 2px 0 0; font-size: 12.5px; color: var(--ink-2); }
+  .step .chips { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+
+  /* 主链路步骤间的箭头；可带文字标注（如“汇合公网检索结果”） */
+  .flow-arrow { display: flex; flex-direction: column; align-items: center; padding: 4px 0; }
+  .flow-arrow .line { width: 2px; height: 12px; background: #93a3c4; }
+  .flow-arrow .tri { width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 7px solid #93a3c4; }
+  .flow-arrow .label { font-size: 11.5px; color: var(--ink-3); margin: 3px 0 2px; text-align: center; }
+
+  /* 右侧泳道卡：虚线边框表达“并行 / 旁路”，与主链路实线卡区分 */
+  .side-card {
+    border: 1.5px dashed #b9c9ee;
+    border-radius: 14px;
+    background: #f7f9ff;
+    padding: 12px 14px;
+  }
+  .side-card.amber { border-color: var(--amber-border); background: var(--amber-bg); }
+  .side-card .side-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .side-card .badge {
+    font-size: 11px;
+    font-weight: 800;
+    border-radius: 999px;
+    padding: 1px 10px;
+    background: var(--brand-soft-bg);
+    color: var(--brand);
+    white-space: nowrap;
+  }
+  .side-card.amber .badge { background: #fbead0; color: #b45309; }
+  .side-card .side-title { font-size: 13px; font-weight: 800; color: var(--ink); }
+  .side-card p, .side-card li { margin: 2px 0 0; font-size: 12px; color: var(--ink-2); }
+  .side-card ul { margin: 4px 0 0; padding-left: 16px; }
+
+  /* 泳道卡与主链路的从属关系用左侧虚线尾巴示意 */
+  .side-card .from { font-size: 11px; color: var(--ink-3); margin-bottom: 6px; }
+
+  /* 主/侧卡在网格中的落位（行号与 HTML 内注释对应；窄屏时回退为单列自然流） */
+  .g-main { grid-column: 1; }
+  .g-side { grid-column: 2; }
+
+  /* 图例 */
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 14px; font-size: 12px; color: var(--ink-2); align-items: center; }
+  .legend .item { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .sw-llm { width: 16px; height: 16px; border-radius: 50%; background: linear-gradient(135deg, #f2c76d, #b7791f); display: inline-block; }
+  .legend .sw-solid { width: 22px; height: 12px; border: 1px solid var(--line); border-radius: 4px; background: #fff; display: inline-block; }
+  .legend .sw-dash { width: 22px; height: 12px; border: 1.5px dashed #b9c9ee; border-radius: 4px; background: #f7f9ff; display: inline-block; }
+
+  /* ========== 持久化与观测 ========== */
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+
+  footer {
+    margin-top: 46px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+
+  /* 窄屏：泳道并入主列，保持可读 */
+  @media (max-width: 920px) {
+    .flow { grid-template-columns: 1fr; }
+    .g-main, .g-side { grid-column: 1 !important; grid-row: auto !important; }
+    .g-side { margin: 6px 0; }
+    .duo { grid-template-columns: 1fr; }
+    .duo .link { min-width: 0; flex-direction: row; padding: 2px 0; }
+    .hero .emblem { display: none; }
+  }
+  @media print {
+    body { background: #fff; }
+    .hero { box-shadow: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ===================== 顶部 Hero ===================== -->
+  <header class="hero">
+    <p class="eyebrow">AGENT LEARNING · ARCHITECTURE</p>
+    <h1>法律咨询 Agent · 项目架构图</h1>
+    <p class="sub">
+      学习型 Python Agent 项目：本地 Web UI 咨询入口，一轮咨询由 4 次 LLM 调用编排，
+      本地法条 RAG（BGE-M3 + Chroma）与公网案例检索并行取证，带会话持久化、跨会话案件记忆与链路自修复。
+    </p>
+    <div class="tech">
+      <span>Python · FastAPI</span>
+      <span>React 19 + Material UI（Vite 构建）</span>
+      <span>OpenAI 兼容 Responses API</span>
+      <span>BGE-M3 + Chroma</span>
+      <span>博查 Web Search</span>
+      <span>unittest + Vitest</span>
+    </div>
+    <div class="emblem" aria-hidden="true">⚖</div>
+  </header>
+
+  <!-- ===================== 图 1 · 系统分层架构 ===================== -->
+  <div class="section-title">
+    <span class="no">图 1</span>
+    <h2>系统分层架构</h2>
+    <span class="hint">自上而下：入口 → Web → 业务编排 → 通用能力 → 数据与外部服务</span>
+  </div>
+
+  <!-- L1 入口层 -->
+  <section class="layer">
+    <div class="layer-head">
+      <span class="dot" style="background:#2b4ecb"></span>
+      <span class="name">入口层</span>
+      <span class="path">仓库根目录 / scripts/</span>
+    </div>
+    <div class="layer-body">
+      <div class="card">
+        <h3><span class="code">main.py</span></h3>
+        <p>默认启动法律咨询本地 Web UI；<span class="code">--mode chat</span> 进入旧普通聊天 CLI。</p>
+      </div>
+      <div class="card">
+        <h3><span class="code">legal_agent_demo.py</span></h3>
+        <p>法律咨询命令行入口，启动时默认预热本地 RAG（<span class="code">LEGAL_RAG_PRELOAD=0</span> 可跳过）。</p>
+      </div>
+      <div class="card">
+        <h3><span class="code">scripts/</span></h3>
+        <ul>
+          <li><span class="code">build_legal_chroma.py</span> 构建法条向量库</li>
+          <li><span class="code">test_legal_chroma.py</span> 实链路检索自测</li>
+          <li><span class="code">plan_legal_queries.py</span> query 规划器调试</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <div class="layer-arrow"><span class="line"></span><span class="tri"></span></div>
+
+  <!-- L2 Web 层 -->
+  <section class="layer">
+    <div class="layer-head">
+      <span class="dot" style="background:#5b52d6"></span>
+      <span class="name">Web 层</span>
+      <span class="path">frontend/src/ ⇄ web_app/</span>
+    </div>
+    <div class="duo">
+      <div class="card">
+        <h3>前端 <span class="code">frontend/src/</span>（React + MUI）</h3>
+        <ul>
+          <li><span class="code">App.jsx</span> 顶层编排：三栏布局（执行进度 / 对话 / 参考资料）</li>
+          <li><span class="code">stream.js</span> 解析 NDJSON 流；<span class="evt">answer_delta</span> 80ms 缓冲合并渲染</li>
+          <li><span class="code">SessionDrawer</span> 历史会话切换/删除 · <span class="code">SupplementDialog</span> 补充信息弹窗</li>
+          <li><span class="code">theme.js</span> 品牌视觉 token · <span class="code">icons.jsx</span> 内联图标 · <span class="code">PanelShell</span> 面板外壳</li>
+          <li><span class="code">npm run build</span> → 产物输出 <span class="code">web_app/static/</span>（base=/static/）</li>
+        </ul>
+      </div>
+      <div class="link" aria-hidden="true">
+        <span class="arrows">⇅</span>
+        <span class="proto">NDJSON 事件流 / REST</span>
+        <span class="arrows">⇅</span>
+      </div>
+      <div class="card">
+        <h3>后端 <span class="code">web_app/server.py</span>（FastAPI）</h3>
+        <ul>
+          <li><span class="code">POST /api/chat</span>：NDJSON 流（session / 业务事件 / answer_delta / pause / final / done）</li>
+          <li><span class="code">GET·DELETE /api/sessions</span> 历史会话；<span class="code">GET /api/metrics</span> 轮级指标聚合</li>
+          <li><span class="code">/api/health</span>、<span class="code">/api/preload</span>（RAG 预热）与静态资源托管</li>
+          <li>全局 <span class="code">chat_lock</span> 串行处理；事件字段白名单脱敏后才下发浏览器</li>
+          <li>轮首按关键词召回跨会话记忆，轮末写会话快照与案件记忆</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <div class="layer-arrow"><span class="line"></span><span class="tri"></span></div>
+
+  <!-- L3 业务编排层 -->
+  <section class="layer">
+    <div class="layer-head">
+      <span class="dot" style="background:#b7791f"></span>
+      <span class="name">法律咨询业务编排层</span>
+      <span class="path">agent_system/legal_consultation/</span>
+    </div>
+    <div class="layer-body">
+      <div class="card">
+        <h3><span class="code">session.py</span> · LegalConsultationSession</h3>
+        <p>串联一轮咨询 workflow；<span class="code">StreamingAnswerSanitizer</span> 流式答案行级清洗；
+           <span class="code">export / restore_snapshot</span> 会话快照导出与恢复。</p>
+      </div>
+      <div class="card">
+        <h3><span class="code">subtasks.py</span> · 四个子任务</h3>
+        <ul>
+          <li>LegalCaseStateUpdater 案件状态更新</li>
+          <li>LegalCaseRagSubtask 案情拆解 + 多 query 法条检索</li>
+          <li>LegalDeterministicWebSearchSubtask 确定性公网检索</li>
+          <li>LegalCaseAnalyzer 综合分析（风险 + 目录 + 下一步）</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="code">models.py / factory.py</span></h3>
+        <p>LegalCaseState 等结构化模型；会话工厂让 LLM client 与 BGE-M3 检索器跨会话共享、惰性构建。</p>
+      </div>
+    </div>
+    <div class="layer-note">
+      链路自修复：状态更新 / RAG / 综合分析失败时发 <span class="evt">legal_selfheal</span> 并降级继续；最终回答失败自动非流式重试一次。
+      每轮结束发 <span class="evt">legal_turn_metrics</span>（阶段耗时 · LLM usage · 自修复次数）。
+    </div>
+  </section>
+
+  <div class="layer-arrow"><span class="line"></span><span class="tri"></span></div>
+
+  <!-- L4 通用能力层 -->
+  <section class="layer">
+    <div class="layer-head">
+      <span class="dot" style="background:#0f8a5f"></span>
+      <span class="name">通用能力层</span>
+      <span class="path">agent_system/</span>
+    </div>
+    <div class="layer-body">
+      <div class="card">
+        <h3><span class="code">agent/</span> 工具调用闭环</h3>
+        <ul>
+          <li>AgentRunner 通用 function-call 循环（不含业务逻辑）</li>
+          <li>ToolRegistry / LocalTool / AgentEvent</li>
+          <li>工具：<span class="code">search_legal_articles</span>、<span class="code">search_legal_articles_by_keyword</span>、<span class="code">web_search</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="code">llm/</span> 模型访问</h3>
+        <ul>
+          <li>OpenAIChatClient 封装 Responses API（流式 + usage 累计）</li>
+          <li>ChatSession 普通聊天历史 · factory 构建入口</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="code">planning/</span> 检索规划</h3>
+        <p>LegalQueryPlanner 把复杂案情拆成多组检索 query 与关键词；只做拆解，不产出法律结论。</p>
+      </div>
+      <div class="card">
+        <h3><span class="code">retrieval/</span> 法条 RAG</h3>
+        <ul>
+          <li>LocalBGEEmbeddingModel（BGE-M3 本地推理）</li>
+          <li>LegalChromaStore 向量库管理</li>
+          <li>LegalArticleRetriever：语义检索 + 关键词精确匹配兜底</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="code">storage/ · memory/</span> 落盘</h3>
+        <ul>
+          <li>SessionStore 会话存档（meta / snapshot / events）</li>
+          <li>MemoryStore 跨会话案件记忆（关键词召回）</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <div class="layer-arrow"><span class="line"></span><span class="tri"></span></div>
+
+  <!-- L5 数据与外部服务 -->
+  <section class="layer">
+    <div class="layer-head">
+      <span class="dot" style="background:#3c4a66"></span>
+      <span class="name">数据与外部服务</span>
+      <span class="path">data/ · 第三方 API</span>
+    </div>
+    <div class="layer-body">
+      <div class="card">
+        <h3>本地数据 <span class="code">data/</span></h3>
+        <ul>
+          <li><span class="code">最核心法条_9k.json</span> 法条原始数据</li>
+          <li><span class="code">chroma/</span> 向量库持久化目录</li>
+          <li><span class="code">sessions/</span> 会话存档 · <span class="code">memory/</span> 案件记忆</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>外部服务</h3>
+        <ul>
+          <li>OpenAI 兼容 LLM API（Responses 协议）</li>
+          <li>博查 Web Search API（公网案例 / 司法实践）</li>
+          <li>BGE-M3 模型（本地推理，首次运行自动下载）</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>配置 <span class="code">agent_system/config.py</span></h3>
+        <p>读取优先级：环境变量 &gt; <span class="code">config_local.py</span>（不入 git）&gt; 内置默认值。
+           涵盖 LLM / Embedding / Chroma / 检索 / Web Search 配置。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== 图 2 · 一轮咨询执行流程 ===================== -->
+  <div class="section-title">
+    <span class="no">图 2</span>
+    <h2>一轮咨询执行流程</h2>
+    <span class="hint">成功链路共 4 次 LLM 调用；右侧为并行泳道与暂停旁路</span>
+  </div>
+
+  <div class="flow">
+    <!-- 主链路（左列）：行号与右侧泳道卡的 grid-row 对应 -->
+    <div class="step g-main" style="grid-row:1">
+      <div class="step-head">
+        <span class="step-no">▶</span>
+        <span class="step-title">用户发送案情 / 补充信息</span>
+        <span class="tag tag-local">浏览器</span>
+      </div>
+      <p>POST <span class="code">/api/chat</span>（携带 session_id，为空则新建会话并回传 <span class="evt">session</span> 事件）。
+         轮首后端按关键词召回其他会话的案件记忆，注入本轮 prompt。</p>
+      <div class="chips"><span class="evt">legal_memory_recalled</span></div>
+    </div>
+    <div class="flow-arrow g-main" style="grid-row:2"><span class="line"></span><span class="tri"></span></div>
+
+    <div class="step g-main" style="grid-row:3">
+      <div class="step-head">
+        <span class="step-no llm">1</span>
+        <span class="step-title">案件状态更新</span>
+        <span class="tag tag-llm">LLM 调用 ①</span>
+      </div>
+      <p>LegalCaseStateUpdater 把新对话合并进结构化案件状态，并给出可补充的关键信息建议。</p>
+      <div class="chips">
+        <span class="evt">case_state_updated</span>
+        <span class="evt">legal_missing_details_suggested</span>
+      </div>
+    </div>
+    <div class="flow-arrow g-main" style="grid-row:4">
+      <span class="label">状态更新完成后，立即后台启动公网检索 →</span>
+      <span class="line"></span><span class="tri"></span>
+    </div>
+
+    <div class="step g-main" style="grid-row:5">
+      <div class="step-head">
+        <span class="step-no llm">2</span>
+        <span class="step-title">检索 query 规划</span>
+        <span class="tag tag-llm">LLM 调用 ②</span>
+      </div>
+      <p>LegalQueryPlanner 把案情拆成多组语义 query 和精确关键词，并推荐目标法律名。</p>
+    </div>
+    <div class="flow-arrow g-main" style="grid-row:6"><span class="line"></span><span class="tri"></span></div>
+
+    <div class="step g-main" style="grid-row:7">
+      <div class="step-head">
+        <span class="step-no">∥</span>
+        <span class="step-title">并发本地法条检索（RAG）</span>
+        <span class="tag tag-local">本地检索</span>
+      </div>
+      <p>语义检索（BGE-M3 + Chroma）∥ 关键词精确匹配兜底，两路 fan-out 并发执行；
+         证据按 <span class="code">evidence_rank_score</span> 融合重排（多 query 重复命中与规划词微调分数）。</p>
+      <div class="chips">
+        <span class="evt">legal_rag_query_started</span>
+        <span class="evt">legal_case_rag_done</span>
+      </div>
+    </div>
+    <div class="flow-arrow g-main" style="grid-row:8"><span class="line"></span><span class="tri"></span></div>
+
+    <div class="step g-main" style="grid-row:9">
+      <div class="step-head">
+        <span class="step-no llm">3</span>
+        <span class="step-title">案情综合分析</span>
+        <span class="tag tag-llm">LLM 调用 ③</span>
+      </div>
+      <p>LegalCaseAnalyzer 一次结构化调用同时产出：风险识别 + 案情目录 + 下一步动作（对外仍按三个事件发出）。</p>
+      <div class="chips">
+        <span class="evt">legal_risk_analyzed</span>
+        <span class="evt">legal_analysis_catalog_built</span>
+        <span class="evt">legal_next_action_decided</span>
+      </div>
+    </div>
+    <div class="flow-arrow g-main" style="grid-row:10">
+      <span class="label">等待公网检索 future 汇合，整理右侧参考资料栏数据</span>
+      <span class="line"></span><span class="tri"></span>
+    </div>
+
+    <div class="step g-main" style="grid-row:11">
+      <div class="step-head">
+        <span class="step-no llm">4</span>
+        <span class="step-title">最终回答（流式）</span>
+        <span class="tag tag-stream">LLM 调用 ④ · 流式</span>
+      </div>
+      <p>AgentRunner 以空工具注册表流式生成（最后阶段不再开放检索工具）；增量先过
+         StreamingAnswerSanitizer 行级清洗再推送。回答固定律师口吻章节：结论 / 当前关键点 / 法律风险 / 现在该做什么 / 还缺哪些关键信息。</p>
+      <div class="chips">
+        <span class="evt">legal_reference_materials</span>
+        <span class="evt">answer_delta</span>
+        <span class="evt">message_done</span>
+      </div>
+    </div>
+    <div class="flow-arrow g-main" style="grid-row:12"><span class="line"></span><span class="tri"></span></div>
+
+    <div class="step g-main" style="grid-row:13">
+      <div class="step-head">
+        <span class="step-no">✓</span>
+        <span class="step-title">轮末提交与落盘</span>
+        <span class="tag tag-local">持久化</span>
+      </div>
+      <p>SessionStore 原子写快照并追加 <span class="code">turn_committed</span>（含白名单轮级指标）；
+         MemoryStore 沉淀案件记忆供后续会话召回。失败轮只记 <span class="code">turn_failed</span> 并回滚会话内存，不写快照。</p>
+      <div class="chips"><span class="evt">legal_turn_metrics</span><span class="evt">done</span></div>
+    </div>
+
+    <!-- 右侧泳道：暂停旁路（对齐步骤①） -->
+    <div class="side-card amber g-side" style="grid-row:3 / span 2">
+      <div class="side-head">
+        <span class="badge">旁路</span>
+        <span class="side-title">暂停等待补充</span>
+      </div>
+      <p class="from">← 由步骤 ① 判定 <span class="code">should_pause_for_supplement</span></p>
+      <p>发 <span class="evt">legal_supplement_required</span>，后端输出顶层 <span class="code">pause</span> 事件（无 final）；
+         前端弹出补充信息弹窗。本轮作为成功轮提交案件状态与追问历史，用户补充后下一轮继续完整链路。</p>
+    </div>
+
+    <!-- 右侧泳道：后台并行公网检索（跨越步骤②→③） -->
+    <div class="side-card g-side" style="grid-row:5 / span 5">
+      <div class="side-head">
+        <span class="badge">并行</span>
+        <span class="side-title">确定性公网检索（后台 future）</span>
+      </div>
+      <p class="from">← 步骤 ① 完成后立即启动，与 RAG、综合分析全程并行</p>
+      <ul>
+        <li>复用 <span class="code">web_search</span> 工具，3 条固定 query 并发：相似案例 / 司法解释与权威规定 / 裁判规则与司法实践</li>
+        <li>司法解释 query 用 include 限定官方与专业法律站点，其余用 exclude 排除低质站点</li>
+        <li>结果按域名权威度分级重排（权威 / 专业 / 普通 / 低置信），每条 query 取 10 选 5</li>
+        <li>失败只转 warning，不中断本地法条分析</li>
+        <li>结果在步骤 ④ 前汇合，经白名单进入右侧参考资料栏 ↘</li>
+      </ul>
+      <div class="chips" style="margin-top:6px">
+        <span class="evt">legal_web_search_started</span>
+        <span class="evt">legal_web_search_done</span>
+      </div>
+    </div>
+
+    <!-- 右侧泳道：自修复说明（对齐步骤④与落盘） -->
+    <div class="side-card g-side" style="grid-row:11 / span 3">
+      <div class="side-head">
+        <span class="badge">自修复</span>
+        <span class="side-title">失败降级与重试</span>
+      </div>
+      <ul>
+        <li>①②③ 任一失败：发 <span class="evt">legal_selfheal</span>（degraded），以旧状态 / 空证据 / 默认动作降级继续</li>
+        <li>④ 失败：自动非流式重试一次（retried），再失败才整轮回滚</li>
+        <li>每轮发 <span class="evt">legal_turn_metrics</span>：阶段耗时、LLM usage 增量、自修复次数</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span class="item"><span class="sw-llm"></span>金色圆徽 = LLM 调用（成功链路一轮共 4 次）</span>
+    <span class="item"><span class="sw-solid"></span>实线卡 = 主链路步骤</span>
+    <span class="item"><span class="sw-dash"></span>虚线卡 = 并行泳道 / 旁路</span>
+    <span class="item"><span class="evt">紫色芯片</span> = AgentEvent 事件（前端进度区展示）</span>
+    <span class="item"><span class="code">蓝色芯片</span> = 文件 / 模块 / 接口</span>
+  </div>
+
+  <!-- ===================== 图 3 · 持久化与观测 ===================== -->
+  <div class="section-title">
+    <span class="no">图 3</span>
+    <h2>持久化与观测</h2>
+    <span class="hint">工具调用过程不进公开消息历史，观测数据全部走事件通道</span>
+  </div>
+
+  <div class="grid-3">
+    <div class="card">
+      <h3>会话存档 <span class="code">data/sessions/&lt;id&gt;/</span></h3>
+      <ul>
+        <li><span class="code">meta.json</span> 标题 / 创建·更新时间 / 轮次</li>
+        <li><span class="code">snapshot.json</span> 公开 messages + case_state + 资料 + 待补充请求（原子写）</li>
+        <li><span class="code">events.jsonl</span> append-only：session_created / turn_committed / turn_failed（单调 seq）</li>
+        <li>session_id 白名单正则校验，防路径穿越</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>跨会话记忆 <span class="code">data/memory/</span></h3>
+      <ul>
+        <li>轮末把 case_state 知识沉淀为案件记忆</li>
+        <li>新会话轮首按关键词召回（排除本会话自身），注入状态更新与最终回答 prompt</li>
+        <li>命中时发 <span class="evt">legal_memory_recalled</span>，写盘失败降级为非致命提示</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>运行指标 <span class="code">GET /api/metrics</span></h3>
+      <ul>
+        <li>每轮 <span class="evt">legal_turn_metrics</span> 过白名单后随 turn_committed 落盘</li>
+        <li>接口扫描各会话 events.jsonl 聚合：轮数 / 失败轮 / 成功率 / 总耗时 / LLM usage</li>
+        <li>不维护内存计数器，重启不丢数据</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>
+    agent_learning · 法律咨询 Agent 架构图 · 2026-07 · 项目结构变化时同步更新本页（docs/architecture.html）
+  </footer>
+</div>
+</body>
+</html>

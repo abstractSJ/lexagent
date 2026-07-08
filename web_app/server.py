@@ -58,6 +58,7 @@ class SupportsLegalWebSession(Protocol):
         *,
         on_event: Callable[[AgentEvent], None] | None = None,
         recalled_memories: list[dict[str, Any]] | None = None,
+        allow_pause: bool = True,
     ) -> tuple[str, list[AgentEvent]]:
         """
         执行一轮法律咨询，并通过回调实时输出过程事件。
@@ -67,6 +68,8 @@ class SupportsLegalWebSession(Protocol):
             on_event: 可选过程事件回调。
             recalled_memories: 可选跨会话历史记忆负载。后端只在确有召回时传入该参数，
                 因此不支持记忆的旧会话实现（含既有测试 fake）无需修改也能继续工作。
+            allow_pause: 是否允许本轮暂停等待补充。后端只在用户明确跳过补充时传 False，
+                与 recalled_memories 一样按需传入，旧实现无需修改。
 
         Returns:
             tuple[str, list[AgentEvent]]: 最终回答和过程事件。
@@ -84,6 +87,8 @@ class ChatRequest(BaseModel):
         selected_questions: 用户确认本轮要处理的追问项。
         selected_evidence_gaps: 用户确认可补充或正在准备的证据材料。
         free_text: 用户额外补充的自由文本。
+        skip_supplement: 用户明确表示无法补充，要求基于现有信息继续分析。
+            为 True 时后端合成兜底输入并禁用本轮暂停判定，避免流程被阻塞性补充卡死。
     """
 
     session_id: str | None = None
@@ -92,6 +97,7 @@ class ChatRequest(BaseModel):
     selected_questions: list[str] | None = None
     selected_evidence_gaps: list[str] | None = None
     free_text: str | None = None
+    skip_supplement: bool = False
 
 
 EVENT_TITLES: dict[str, str] = {
@@ -103,6 +109,7 @@ EVENT_TITLES: dict[str, str] = {
     "case_state_updated": "案件状态已更新",
     "legal_missing_details_suggested": "可先补充的关键信息",
     "legal_supplement_required": "等待补充关键信息",
+    "legal_supplement_skipped": "已按现有信息继续分析",
     "legal_case_rag_done": "案情拆解与检索完成",
     "legal_web_search_started": "公网案例与司法实践检索中",
     "legal_web_search_done": "公网案例与司法实践检索完成",
@@ -445,146 +452,152 @@ def create_app(
         if not app.state.chat_lock.acquire(blocking=False):
             return StreamingResponse(iter_busy_stream(), media_type=NDJSON_MEDIA_TYPE)
 
-        # 会话解析放在 chat_lock 之内：一方面新会话目录只在确定本轮会执行时才创建，
-        # 避免忙碌重试在磁盘上留下一堆空会话；另一方面与删除接口天然互斥。
+        # 锁一旦获取，任何提前退出路径（会话工厂抛 RuntimeError、线程创建失败等）都必须释放；
+        # 否则后续所有 /api/chat 会永远收到“正在处理”，服务假死。worker 成功启动后，
+        # 释放责任移交给 run_agent 的 finally，本函数的 finally 不再重复释放。
         session_id: str | None = None
+        worker_started = False
         try:
-            if app.state.legal_session is not None:
-                target_session: SupportsLegalWebSession = app.state.legal_session
-            else:
-                requested_id = str(request.session_id or "").strip()
-                if requested_id:
-                    target_session = get_or_load_session(requested_id)
-                    session_id = requested_id
-                else:
-                    session_id = app.state.store.create_session()
-                    target_session = app.state.session_factory()
-                    with app.state.registry_lock:
-                        app.state.sessions[session_id] = target_session
-        except (HTTPException, SessionStoreError) as error:
-            app.state.chat_lock.release()
-            if isinstance(error, SessionStoreError):
-                raise HTTPException(status_code=500, detail=str(error)) from error
-            raise
-
-        # 记忆检索在启动后台线程前完成：它只读本地小文件，毫秒级返回，
-        # 放在这里可以让整轮链路（包括状态更新 prompt）从一开始就带上历史背景。
-        recalled_memories = recall_memories_for_input(user_input, session_id)
-
-        event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
-        error_event_forwarded = False
-        search_started_forwarded = False
-
-        def push(item: dict[str, Any]) -> None:
-            """
-            将待发送的事件写入线程安全队列。
-
-            Args:
-                item: 已规范化的前端事件。
-            """
-
-            event_queue.put(item)
-
-        if session_id is not None:
-            # 首个流事件回传会话 ID。新会话由后端分配 ID，前端必须先拿到它，
-            # 后续轮次和刷新后的历史恢复才能路由到同一个会话。
-            push({"type": "session", "session_id": session_id})
-
-        def on_event(event: AgentEvent) -> None:
-            """
-            接收业务层事件并转成 Web 前端易消费的格式。
-            """
-
-            nonlocal error_event_forwarded, search_started_forwarded
-            event_type = str(event.type)
-            if event_type == "error":
-                error_event_forwarded = True
-                error_data = event.data if isinstance(event.data, dict) else {"error": event.data}
-                push({"type": "error", "message": str(error_data.get("error") or error_data)})
-                return
-            if event_type == "answer_delta":
-                # 最终回答增量走顶层 answer_delta 流事件，不进入右侧执行进度区。
-                # 原因是每个增量都包装成 event 卡片会把进度区刷爆，前端只需要把它拼进聊天气泡。
-                delta_data = event.data if isinstance(event.data, dict) else {}
-                delta_text = str(delta_data.get("delta") or "")
-                if delta_text:
-                    push({"type": "answer_delta", "delta": delta_text})
-                return
-            if event_type == "legal_rag_query_started":
-                if search_started_forwarded:
-                    return
-                search_started_forwarded = True
-            normalized_event = normalize_agent_event(event)
-            if normalized_event is not None:
-                push(normalized_event)
-
-        def run_agent() -> None:
-            """
-            在后台线程中执行同步法律咨询链路。
-
-            这样做的原因是 LLM 调用和本地 RAG 都是阻塞型工作；放到后台线程后，HTTP 流可以边取
-            队列边向浏览器输出事件，不会等整轮任务结束才一次性返回。
-            """
-
+            # 会话解析放在 chat_lock 之内：一方面新会话目录只在确定本轮会执行时才创建，
+            # 避免忙碌重试在磁盘上留下一堆空会话；另一方面与删除接口天然互斥。
             try:
-                if recalled_memories:
-                    answer, events = target_session.ask_with_events(
-                        user_input,
-                        on_event=on_event,
-                        recalled_memories=recalled_memories,
-                    )
+                if app.state.legal_session is not None:
+                    target_session: SupportsLegalWebSession = app.state.legal_session
                 else:
-                    # 无召回时不传该参数，兼容尚未支持记忆注入的旧会话实现和测试 fake。
-                    answer, events = target_session.ask_with_events(user_input, on_event=on_event)
-                try:
-                    # 持久化在 final/pause 事件之前执行：前端收到 final 后可能立即刷新会话列表，
-                    # 此时快照必须已经落盘，否则列表里拿到的还是上一轮的标题和轮次。
-                    persist_committed_turn(session_id, target_session, events, answer)
-                except SessionStoreError as persist_error:
-                    # 回答本身已成功，持久化失败只影响历史保存；用普通事件卡片提示，
-                    # 不走顶层 error 流事件，避免前端把整轮标记为失败。
-                    push(
-                        {
-                            "type": "event",
-                            "event_type": "error",
-                            "title": "会话保存失败",
-                            "data": {"error": str(persist_error)},
-                        }
-                    )
-                try:
-                    persist_case_memory(session_id, target_session)
-                except Exception as memory_error:
-                    # 记忆沉淀失败同样不影响本轮回答，也不影响会话快照；单独软提示。
-                    push(
-                        {
-                            "type": "event",
-                            "event_type": "error",
-                            "title": "记忆沉淀失败",
-                            "data": {"error": str(memory_error)},
-                        }
-                    )
-                pause_event = find_event(events, "legal_supplement_required")
-                if pause_event is not None:
-                    push(build_pause_stream_item(pause_event, fallback_message=answer))
-                else:
-                    push({"type": "final", "answer": answer})
-            except Exception as error:
-                if app.state.store is not None and session_id is not None:
-                    try:
-                        app.state.store.append_event(session_id, "turn_failed", {"error": str(error)})
-                    except SessionStoreError:
-                        # 失败轮的事件记录属于尽力而为，写不进去也不能掩盖原始业务错误。
-                        pass
-                if not error_event_forwarded:
-                    push({"type": "error", "message": str(error)})
-            finally:
-                push({"type": "done"})
-                event_queue.put(None)
-                app.state.chat_lock.release()
+                    requested_id = str(request.session_id or "").strip()
+                    if requested_id:
+                        target_session = get_or_load_session(requested_id)
+                        session_id = requested_id
+                    else:
+                        session_id = app.state.store.create_session()
+                        target_session = app.state.session_factory()
+                        with app.state.registry_lock:
+                            app.state.sessions[session_id] = target_session
+            except SessionStoreError as error:
+                raise HTTPException(status_code=500, detail=str(error)) from error
 
-        worker = threading.Thread(target=run_agent, name="legal-web-chat", daemon=True)
-        worker.start()
-        return StreamingResponse(iter_queue_as_ndjson(event_queue, worker), media_type=NDJSON_MEDIA_TYPE)
+            # 记忆检索在启动后台线程前完成：它只读本地小文件，毫秒级返回，
+            # 放在这里可以让整轮链路（包括状态更新 prompt）从一开始就带上历史背景。
+            recalled_memories = recall_memories_for_input(user_input, session_id)
+
+            event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+            error_event_forwarded = False
+            search_started_forwarded = False
+
+            def push(item: dict[str, Any]) -> None:
+                """
+                将待发送的事件写入线程安全队列。
+
+                Args:
+                    item: 已规范化的前端事件。
+                """
+
+                event_queue.put(item)
+
+            if session_id is not None:
+                # 首个流事件回传会话 ID。新会话由后端分配 ID，前端必须先拿到它，
+                # 后续轮次和刷新后的历史恢复才能路由到同一个会话。
+                push({"type": "session", "session_id": session_id})
+
+            def on_event(event: AgentEvent) -> None:
+                """
+                接收业务层事件并转成 Web 前端易消费的格式。
+                """
+
+                nonlocal error_event_forwarded, search_started_forwarded
+                event_type = str(event.type)
+                if event_type == "error":
+                    error_event_forwarded = True
+                    error_data = event.data if isinstance(event.data, dict) else {"error": event.data}
+                    push({"type": "error", "message": str(error_data.get("error") or error_data)})
+                    return
+                if event_type == "answer_delta":
+                    # 最终回答增量走顶层 answer_delta 流事件，不进入右侧执行进度区。
+                    # 原因是每个增量都包装成 event 卡片会把进度区刷爆，前端只需要把它拼进聊天气泡。
+                    delta_data = event.data if isinstance(event.data, dict) else {}
+                    delta_text = str(delta_data.get("delta") or "")
+                    if delta_text:
+                        push({"type": "answer_delta", "delta": delta_text})
+                    return
+                if event_type == "legal_rag_query_started":
+                    if search_started_forwarded:
+                        return
+                    search_started_forwarded = True
+                normalized_event = normalize_agent_event(event)
+                if normalized_event is not None:
+                    push(normalized_event)
+
+            def run_agent() -> None:
+                """
+                在后台线程中执行同步法律咨询链路。
+
+                这样做的原因是 LLM 调用和本地 RAG 都是阻塞型工作；放到后台线程后，HTTP 流可以边取
+                队列边向浏览器输出事件，不会等整轮任务结束才一次性返回。
+                """
+
+                try:
+                    # 可选参数只在需要时传入：不带记忆、不跳过补充的常规轮保持旧调用形态，
+                    # 兼容尚未支持这些参数的旧会话实现和测试 fake。
+                    ask_kwargs: dict[str, Any] = {}
+                    if recalled_memories:
+                        ask_kwargs["recalled_memories"] = recalled_memories
+                    if request.skip_supplement:
+                        # 用户明确表示无法补充：本轮禁用暂停判定，强制基于现有信息走完整链路。
+                        ask_kwargs["allow_pause"] = False
+                    answer, events = target_session.ask_with_events(user_input, on_event=on_event, **ask_kwargs)
+                    try:
+                        # 持久化在 final/pause 事件之前执行：前端收到 final 后可能立即刷新会话列表，
+                        # 此时快照必须已经落盘，否则列表里拿到的还是上一轮的标题和轮次。
+                        persist_committed_turn(session_id, target_session, events, answer)
+                    except SessionStoreError as persist_error:
+                        # 回答本身已成功，持久化失败只影响历史保存；用普通事件卡片提示，
+                        # 不走顶层 error 流事件，避免前端把整轮标记为失败。
+                        push(
+                            {
+                                "type": "event",
+                                "event_type": "error",
+                                "title": "会话保存失败",
+                                "data": {"error": str(persist_error)},
+                            }
+                        )
+                    try:
+                        persist_case_memory(session_id, target_session)
+                    except Exception as memory_error:
+                        # 记忆沉淀失败同样不影响本轮回答，也不影响会话快照；单独软提示。
+                        push(
+                            {
+                                "type": "event",
+                                "event_type": "error",
+                                "title": "记忆沉淀失败",
+                                "data": {"error": str(memory_error)},
+                            }
+                        )
+                    pause_event = find_event(events, "legal_supplement_required")
+                    if pause_event is not None:
+                        push(build_pause_stream_item(pause_event, fallback_message=answer))
+                    else:
+                        push({"type": "final", "answer": answer})
+                except Exception as error:
+                    if app.state.store is not None and session_id is not None:
+                        try:
+                            app.state.store.append_event(session_id, "turn_failed", {"error": str(error)})
+                        except SessionStoreError:
+                            # 失败轮的事件记录属于尽力而为，写不进去也不能掩盖原始业务错误。
+                            pass
+                    if not error_event_forwarded:
+                        push({"type": "error", "message": str(error)})
+                finally:
+                    push({"type": "done"})
+                    event_queue.put(None)
+                    app.state.chat_lock.release()
+
+            worker = threading.Thread(target=run_agent, name="legal-web-chat", daemon=True)
+            worker.start()
+            worker_started = True
+            return StreamingResponse(iter_queue_as_ndjson(event_queue, worker), media_type=NDJSON_MEDIA_TYPE)
+        finally:
+            if not worker_started:
+                app.state.chat_lock.release()
 
     @app.get("/api/sessions")
     def list_sessions() -> dict[str, Any]:
@@ -791,6 +804,11 @@ def build_chat_input(request: ChatRequest) -> str:
     if free_text:
         parts.append("【其他补充说明】")
         parts.append(free_text)
+
+    if request.skip_supplement:
+        # 跳过补充时必须保证输入非空：即使用户什么都没填，也要给状态更新器一句明确的
+        # “无法补充”声明，配合 prompt 规则避免下一轮再次触发同样的暂停。
+        parts.append("我暂时无法补充更多信息，请基于目前已提供的信息继续分析。")
 
     return "\n".join(parts).strip()
 
@@ -1004,6 +1022,9 @@ def sanitize_event_for_web(event_type: str, data: dict[str, Any]) -> tuple[str, 
         return None
     if event_type == "legal_supplement_required":
         return None
+    if event_type == "legal_supplement_skipped":
+        # reason 是状态更新器的内部判定文案，可能引用具体案情细节；进度区只需要概括状态。
+        return event_type, {"status": "continued"}
     if event_type == "legal_step":
         return event_type, {
             "name": str(data.get("name") or ""),
@@ -1241,6 +1262,8 @@ def build_event_title(event_type: str, data: dict[str, Any]) -> str:
         return f"参考资料已整理：法条 {law_count} 条，案例/实务 {web_count} 条"
     if event_type == "legal_missing_details_suggested":
         return "可先补充的关键信息"
+    if event_type == "legal_supplement_skipped":
+        return "无法补充，已按现有信息继续分析"
     if event_type == "legal_risk_analyzed":
         return f"风险识别完成：{data.get('risk_count', 0)} 项"
     if event_type == "legal_next_action_decided":

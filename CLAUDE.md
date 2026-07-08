@@ -70,6 +70,7 @@ frontend/src/               React + Material UI 前端源码
 web_app/                    FastAPI 本地 Web UI 和 Vite 构建静态产物
 tests/                      unittest 测试
 data/                       法条原始数据、Chroma 持久化目录、会话存档（data/sessions/）和案件记忆（data/memory/）
+docs/                       项目文档（architecture.html 架构图，自包含单文件，浏览器直接打开）
 ```
 
 ## 配置
@@ -196,6 +197,7 @@ legal_agent_demo.py
   -> LegalCaseStateUpdater.update()                       [LLM 调用 1]
        -> 先发 legal_missing_details_suggested 事件，提示可补充的关键信息
        -> 如 should_pause_for_supplement=true，发 legal_supplement_required，提交状态并暂停等待用户补充
+       -> 调用方传 allow_pause=False 时忽略暂停判定，发 legal_supplement_skipped 后继续完整链路
   -> 启动 LegalDeterministicWebSearchSubtask.run() 后台 future
        -> 状态更新后立即启动，rag/risks/catalog/next_action 传 None
        -> 与本地 RAG 和综合分析全程并行；三条固定 query 并发检索（相似案例 / 司法解释与权威规定 / 裁判规则与司法实践），失败转 warning
@@ -221,13 +223,13 @@ legal_agent_demo.py
 
 - 内部子调用的原始 prompt/response 不写入主会话 `history()`。
 - `LegalConsultationSession.history()` 只保存公开 system/user/assistant。
-- 子任务结果通过 `AgentEvent` 暴露，如 `legal_step`、`legal_selfheal`、`legal_memory_recalled`、`legal_rag_query_started`、`case_state_updated`、`legal_missing_details_suggested`、`legal_supplement_required`、`legal_case_rag_done`、`legal_web_search_started/done`、`legal_reference_materials`、`legal_next_action_decided`、`legal_turn_metrics`、`answer_delta`。
+- 子任务结果通过 `AgentEvent` 暴露，如 `legal_step`、`legal_selfheal`、`legal_memory_recalled`、`legal_rag_query_started`、`case_state_updated`、`legal_missing_details_suggested`、`legal_supplement_required`、`legal_supplement_skipped`、`legal_case_rag_done`、`legal_web_search_started/done`、`legal_reference_materials`、`legal_next_action_decided`、`legal_turn_metrics`、`answer_delta`。
 - “案情拆解 + 多 query RAG”是一个子任务，复用已有 query planner 和 retriever；planner 串行执行，后续多 query/关键词检索可并发 fan-out；语义检索和关键词兜底都按 planner 推荐的法律名上限展开，避免关键词只搜第一部法律造成跨法域漏召回。
 - 法条证据用融合分数重排（`evidence_rank_score`）：检索分数为主体，多 query 重复命中和 planner 的 positive_terms 小幅加分、negative_terms 小幅减分；语义检索每条 query 前两名保底，其余低于 0.30 的长尾剔除。不要改回 hit_count 绝对优先的排序。
 - 风险识别、案情目录和下一步动作由 `LegalCaseAnalyzer` 一次 LLM 调用合并产出（一轮成功链路共 4 次 LLM 调用：状态更新、query 规划、综合分析、最终回答）；不要拆回三次串行调用。
 - 确定性公网检索复用 `web_search` 工具，在案件状态更新后立即后台启动（早于 RAG，rag 等参数传 None），与本地检索和综合分析全程并行；三条固定 query 分别面向相似案例、司法解释/权威规定和裁判规则/实务口径，司法解释 query 用 include 限定官方与专业法律站点，其余 query 用 exclude 排除低质站点；每条 query 取 10 条候选、按权威度重排后保留 5 条，`LegalWebSearchItem.authority_level` 进入最终 prompt 和资料栏（权威/专业/低置信标识）；结果进入最终临时 runtime input，并通过 `legal_reference_materials` 的安全白名单字段进入右侧参考资料栏，不写入公开 history；Web 进度区只展示脱敏计数。
 - 公网来源权威度分级和站点名单（`HIGH/MEDIUM/LOW_AUTHORITY_DOMAIN_SUFFIXES`）维护在 `subtasks.py` 顶部常量区；调整名单不需要动排序逻辑。
-- 状态更新器可通过 `should_pause_for_supplement` 暂停后续链路；暂停轮次作为成功轮次提交 `case_state` 和公开 user/assistant 追问历史，下一轮用户补充后再继续完整链路。
+- 状态更新器可通过 `should_pause_for_supplement` 暂停后续链路；暂停轮次作为成功轮次提交 `case_state` 和公开 user/assistant 追问历史，下一轮用户补充后再继续完整链路。用户确实无法补充时不能卡死流程：`ask_with_events(allow_pause=False)` 忽略暂停判定、发 `legal_supplement_skipped` 后继续完整链路（Web 端由 `/api/chat` 的 `skip_supplement` 字段触发，前端阻塞补充弹窗提供“无法补充，直接分析”按钮）；状态更新 prompt 同时约束“用户明确表示无法补充时不得再次暂停”。
 - 链路自修复：案件状态更新、RAG、案情综合分析失败时发 `legal_selfheal`（action=degraded）并以降级产物继续（沿用旧状态 / 空法条证据 / 空风险 + 默认追问动作）；最终回答失败自动非流式重试一次（action=retried），重试再失败才整轮回滚。`detail` 字段只留内部事件，Web 白名单剥掉。
 - 每轮结束（含暂停补充轮）发 `legal_turn_metrics` 事件：`stages` 各阶段耗时与状态（ok/degraded/retried）、`total_duration_ms`、`llm_usage` 轮增量（共享 `OpenAIChatClient` usage 轮前后快照做差）、`selfheal_count`。观测数据走事件通道，不加返回值。
 - `AgentRunner` 仍保持通用工具调用闭环，不写法律业务逻辑；工具注册表为空且传入 `on_delta` 时走流式路径。法律咨询默认最终回答 runner 使用空工具注册表，避免模型在最后阶段调用检索工具后把长篇法条/案例塞回聊天气泡。
@@ -246,6 +248,9 @@ legal_agent_demo.py
 - `frontend/src/api.js`：调用 `/api/health`、`/api/preload`、`/api/chat`、`/api/sessions`。
 - `frontend/src/stream.js`：读取 `/api/chat` 的 NDJSON 事件流。
 - `frontend/src/eventFormatters.js`：事件标题、摘要、颜色和补充内容展示文本。
+- `frontend/src/theme.js`：品牌视觉 token（深蓝/金色渐变、面板圆角阴影、焦点环常量导出）+ MUI 主题；改配色/圆角先改这里，组件从这里 import 常量。
+- `frontend/src/icons.jsx`：内联 SVG 描边图标集（feather 风格工厂函数生成）；刻意不引入 @mui/icons-material 依赖。
+- `frontend/src/components/PanelShell.jsx`：进度/对话/资料三栏面板的统一外壳（头部图标+标题+操作区+可选 footer），正文滚动行为仍由各面板自管。
 - `frontend/src/components/MarkdownMessage.jsx`：把助手 Markdown 答复渲染成标题、列表、引用等结构化内容。
 - `frontend/src/components/MaterialsPanel.jsx`：右侧参考资料栏，法条和案例/实务资料默认只显示标题，点击后展开详情。
 - `frontend/src/components/SupplementDialog.jsx`：补充信息弹窗，支持阻塞性 pause 和非阻塞追问建议。
@@ -277,7 +282,7 @@ Web 调用流程：
 - 前端刷新后自动恢复最近会话；SessionDrawer 支持切换、新对话和删除，请求进行中禁止这些操作。turn_count 为 0 的空会话不进入历史列表。
 - `create_app(session=...)` 注入单会话是兼容模式：不发 session 事件、不持久化，供旧测试使用；多会话测试用 `create_app(session_factory=..., store=SessionStore(tmp))`。
 - `/api/chat` 使用 `application/x-ndjson`，不要改成一次性 JSON，否则前端无法实时展示进度。
-- `/api/chat` 支持补充表单字段：`supplement_answers`、`selected_questions`、`selected_evidence_gaps`、`free_text`，后端会合成为下一轮用户输入。
+- `/api/chat` 支持补充表单字段：`supplement_answers`、`selected_questions`、`selected_evidence_gaps`、`free_text`，后端会合成为下一轮用户输入；`skip_supplement=true` 表示用户无法补充，后端合成“无法补充”声明并以 `allow_pause=False` 强制继续完整链路。
 - 后端遇到 `legal_supplement_required` 会输出顶层 `pause` 事件和 `done`，不输出 `final`；前端展示补充面板，用户提交后再继续。
 - 最终回答流式：后端把 `answer_delta` 业务事件转成顶层 `{"type": "answer_delta", "delta": "..."}` 流事件；前端聊天区把连续 delta 累积到同一条带打字机光标的 streaming 气泡，`final` 到达时用后端兜底清洗后的完整答案替换气泡文本。
 - `answer_delta` 增量在前端先进缓冲，每 80ms 合并渲染一次（`App.jsx` 的 `ANSWER_DELTA_FLUSH_INTERVAL_MS`）；不要改回逐 delta 直接 setState，否则高频增量会把主线程打满，流式期间补充弹窗无法输入和关闭。

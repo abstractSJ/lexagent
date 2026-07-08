@@ -16,6 +16,17 @@ import {
   TextField,
   Typography,
 } from '@mui/material';
+import { AlertTriangleIcon, CloseIcon, FileTextIcon } from '../icons.jsx';
+
+// 问题/证据卡片的共用外观：白底圆角 + 细边框，hover 时边框轻微加深提示可交互区域。
+// 抽成常量保证两个分组里的卡片始终同款，微调时不会只改到其中一处。
+const ITEM_CARD_SX = {
+  backgroundColor: '#fff',
+  borderRadius: '12px',
+  border: '1px solid #e3e9f4',
+  transition: 'border-color 0.18s ease',
+  '&:hover': { borderColor: '#c8d4ee' },
+};
 
 /**
  * 补充信息弹窗。
@@ -112,13 +123,41 @@ const SupplementDialog = memo(function SupplementDialog({ supplement, open, bloc
     });
   };
 
+  const handleSkip = async () => {
+    // 用户确实没有更多信息时不能把流程卡死：跳过表单校验，直接请求后端基于现有信息
+    // 继续完整分析链路。展示文案和排队/失败恢复逻辑复用普通补充提交的同一条路径。
+    setError('');
+    await onContinue({
+      message: '',
+      skip_supplement: true,
+    });
+  };
+
   return (
     <Dialog open={open} onClose={disabled ? undefined : onClose} fullWidth maxWidth="md" aria-labelledby="supplementDialogTitle">
       <DialogTitle
         id="supplementDialogTitle"
-        sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 2, pb: 1, fontWeight: 900 }}
+        sx={{ display: 'flex', alignItems: 'center', gap: 1.5, pb: 1 }}
       >
-        <Box component="span">{blocking ? '请先补充关键信息' : '补充关键信息'}</Box>
+        {/* 图标块用琥珀/品牌蓝区分“必须补充”与“建议补充”，与聊天区补充入口卡片的色彩语义一致。 */}
+        <Box
+          aria-hidden="true"
+          sx={{
+            width: 34,
+            height: 34,
+            flexShrink: 0,
+            display: 'grid',
+            placeItems: 'center',
+            borderRadius: '10px',
+            backgroundColor: blocking ? '#fbead0' : '#e8edfb',
+            color: blocking ? '#b45309' : '#2b4ecb',
+          }}
+        >
+          {blocking ? <AlertTriangleIcon sx={{ fontSize: 17 }} /> : <FileTextIcon sx={{ fontSize: 17 }} />}
+        </Box>
+        <Box component="span" sx={{ flex: 1, minWidth: 0, fontWeight: 800, fontSize: 17 }}>
+          {blocking ? '请先补充关键信息' : '补充关键信息'}
+        </Box>
         <IconButton
           type="button"
           aria-label="关闭补充信息弹窗"
@@ -126,19 +165,19 @@ const SupplementDialog = memo(function SupplementDialog({ supplement, open, bloc
           onClick={onClose}
           sx={{ color: 'text.secondary' }}
         >
-          ×
+          <CloseIcon sx={{ fontSize: 18 }} />
         </IconButton>
       </DialogTitle>
-      <DialogContent dividers sx={{ backgroundColor: '#f8fafc' }}>
+      <DialogContent dividers sx={{ backgroundColor: '#f6f8fd' }}>
         <Stack spacing={1.5}>
-          <Alert severity={blocking ? 'warning' : 'info'}>
+          <Alert severity={blocking ? 'warning' : 'info'} sx={{ borderRadius: '12px' }}>
             {supplement.reason || supplement.message || '这些信息会帮助后续法律检索和分析更准确。'}
           </Alert>
 
           {questions.length > 0 && (
             <SupplementSection title="需要确认的问题">
               {questions.map((question, index) => (
-                <Paper key={question} variant="outlined" sx={{ p: 1.25, borderRadius: 1, backgroundColor: '#fff' }}>
+                <Paper key={question} elevation={0} sx={{ p: 1.5, ...ITEM_CARD_SX }}>
                   <Stack spacing={1}>
                     <FormControlLabel
                       control={
@@ -151,9 +190,28 @@ const SupplementDialog = memo(function SupplementDialog({ supplement, open, bloc
                         />
                       }
                       label={
-                        <Typography sx={{ fontSize: 14, lineHeight: 1.5 }}>
-                          {index + 1}. {question}
-                        </Typography>
+                        // 题号做成圆形徽章放进 label：与问题文字一起构成 checkbox 的
+                        // 可点击区域，长问题换行时序号也不会挤进正文。
+                        // 顶部留 pt 是为了补偿 checkbox 自带的内边距，让首行与勾选框光学对齐。
+                        <Stack direction="row" spacing={1} sx={{ alignItems: 'flex-start', pt: 1 }}>
+                          <Box
+                            sx={{
+                              width: 22,
+                              height: 22,
+                              flexShrink: 0,
+                              display: 'grid',
+                              placeItems: 'center',
+                              borderRadius: '50%',
+                              backgroundColor: '#e8edfb',
+                              color: '#2b4ecb',
+                              fontSize: 12,
+                              fontWeight: 700,
+                            }}
+                          >
+                            {index + 1}
+                          </Box>
+                          <Typography sx={{ fontSize: 14, lineHeight: 1.5 }}>{question}</Typography>
+                        </Stack>
                       }
                       sx={{ alignItems: 'flex-start', m: 0 }}
                     />
@@ -176,7 +234,7 @@ const SupplementDialog = memo(function SupplementDialog({ supplement, open, bloc
             <SupplementSection title="可补充或说明的证据材料">
               <FormGroup sx={{ gap: 1 }}>
                 {evidenceGaps.map((item) => (
-                  <Paper key={item} variant="outlined" sx={{ px: 1.25, py: 0.5, borderRadius: 1, backgroundColor: '#fff' }}>
+                  <Paper key={item} elevation={0} sx={{ px: 1.5, py: 0.75, ...ITEM_CARD_SX }}>
                     <FormControlLabel
                       control={
                         <Checkbox
@@ -206,10 +264,19 @@ const SupplementDialog = memo(function SupplementDialog({ supplement, open, bloc
             placeholder="例如：时间、金额、地点、对方说法、已有证据、是否报警/仲裁/起诉等。"
           />
 
-          {error && <Alert severity="error">{error}</Alert>}
+          {error && <Alert severity="error" sx={{ borderRadius: '12px' }}>{error}</Alert>}
         </Stack>
       </DialogContent>
-      <DialogActions sx={{ px: 3, py: 1.5 }}>
+      <DialogActions
+        sx={{ px: 3, py: 2, borderTop: '1px solid', borderColor: 'divider', backgroundColor: '#fbfcff' }}
+      >
+        {blocking && (
+          // 阻塞暂停时给一条明确出路：确实无法补充也能让分析继续，避免用户被卡死在补充环节。
+          // 非阻塞建议本来就不拦流程，“先不补充”关闭弹窗即可，不需要这个按钮。
+          <Button type="button" variant="text" color="warning" disabled={disabled} onClick={() => void handleSkip()} sx={{ mr: 'auto' }}>
+            无法补充，直接分析
+          </Button>
+        )}
         <Button type="button" variant="text" disabled={disabled} onClick={onClose}>
           先不补充
         </Button>
@@ -234,7 +301,20 @@ export default SupplementDialog;
 function SupplementSection({ title, children }) {
   return (
     <Stack spacing={1}>
-      <Typography sx={{ fontSize: 13, fontWeight: 900 }}>{title}</Typography>
+      {/* 标题左侧的品牌蓝小竖条用 borderLeft 实现：随文字行高自适应，
+          压低 lineHeight 让竖条保持约 14px 的短线观感。 */}
+      <Typography
+        sx={{
+          fontSize: 13,
+          fontWeight: 700,
+          color: '#3c4a66',
+          lineHeight: 1.2,
+          borderLeft: '3px solid #2b4ecb',
+          pl: 1,
+        }}
+      >
+        {title}
+      </Typography>
       {children}
     </Stack>
   );

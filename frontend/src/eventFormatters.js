@@ -14,6 +14,7 @@ const EVENT_TITLES = {
   legal_rag_query_started: '法条检索中',
   case_state_updated: '案件状态已更新',
   legal_missing_details_suggested: '可先补充的关键信息',
+  legal_supplement_skipped: '已按现有信息继续分析',
   legal_case_rag_done: '案情拆解与检索完成',
   legal_web_search_started: '公网案例与司法实践检索中',
   legal_web_search_done: '公网案例与司法实践检索完成',
@@ -48,6 +49,11 @@ export function humanizeEventType(eventType) {
  */
 export function summarizeEvent(eventType, data = {}) {
   if (eventType === 'legal_step') {
+    // 前端自造的步骤事件（载入历史会话、补充暂存等）只带 message，没有 name/status；
+    // 直接展示 message，避免渲染成"进行中：未命名步骤"这类占位文案。
+    if (!data.name && data.message) {
+      return data.message;
+    }
     const status = data.status === 'start' ? '开始' : data.status || '进行中';
     return `${status}：${data.name || '未命名步骤'}`;
   }
@@ -84,6 +90,9 @@ export function summarizeEvent(eventType, data = {}) {
     const questionCount = Array.isArray(data.questions) ? data.questions.length : 0;
     const evidenceCount = Array.isArray(data.evidence_gaps) ? data.evidence_gaps.length : 0;
     return `${data.message || '建议补充关键信息'}（问题 ${questionCount} 个，材料 ${evidenceCount} 项）`;
+  }
+  if (eventType === 'legal_supplement_skipped') {
+    return '已按你的要求跳过补充，基于现有信息继续检索和分析。';
   }
   if (eventType === 'legal_case_rag_done') {
     return '本地法条检索完成。';
@@ -165,21 +174,25 @@ export function colorForEvent(eventType) {
 }
 
 /**
- * 返回事件卡片的柔和背景色。
+ * 返回事件的展示色调。
+ *
+ * 时间线节点视觉主要消费 iconBg（节点底色）、fg（节点图标色）和 titleColor（标题色）；
+ * borderColor 和 backgroundColor 继续保留并取相近的新色值，是为了兼容仍按旧字段取色的
+ * 引用方，避免升级时间线样式时波及其他展示位。
  *
  * @param {string} eventType 后端事件类型。
- * @returns {{borderColor: string, backgroundColor: string, titleColor: string}} 卡片色彩配置。
+ * @returns {{borderColor: string, backgroundColor: string, titleColor: string, iconBg: string, fg: string}} 事件色彩配置。
  */
 export function toneForEvent(eventType) {
   if (eventType === 'error') {
-    return { borderColor: '#fecdd3', backgroundColor: '#fff1f3', titleColor: '#b42318' };
+    return { borderColor: '#f5c2c0', backgroundColor: '#fdf2f2', titleColor: '#b42318', iconBg: '#fbe3e1', fg: '#c0392b' };
   }
   if (eventType === 'legal_selfheal') {
     // 自修复用琥珀色区分于普通 info：提醒用户本轮有环节波动，但不是失败红色。
-    return { borderColor: '#fde68a', backgroundColor: '#fffbeb', titleColor: '#b45309' };
+    return { borderColor: '#f0dcae', backgroundColor: '#fdf7e7', titleColor: '#9a6410', iconBg: '#f9eccd', fg: '#b7791f' };
   }
   if (eventType === 'done' || eventType === 'message_done') {
-    return { borderColor: '#bbf7d0', backgroundColor: '#ecfdf3', titleColor: '#15803d' };
+    return { borderColor: '#c2e5d2', backgroundColor: '#effaf3', titleColor: '#0f8a5f', iconBg: '#d9f2e4', fg: '#0f8a5f' };
   }
   if (
     eventType === 'legal_rag_query_started' ||
@@ -191,12 +204,12 @@ export function toneForEvent(eventType) {
     eventType === 'tool_call' ||
     eventType === 'tool_result'
   ) {
-    return { borderColor: '#bae6fd', backgroundColor: '#eef6ff', titleColor: '#0369a1' };
+    return { borderColor: '#c9dbf3', backgroundColor: '#f0f6ff', titleColor: '#1e5fae', iconBg: '#dce9fb', fg: '#2270c8' };
   }
   if (eventType === 'legal_step') {
-    return { borderColor: '#ddd6fe', backgroundColor: '#f4f0ff', titleColor: '#7c3aed' };
+    return { borderColor: '#d9d6f6', backgroundColor: '#f5f4ff', titleColor: '#5b52d6', iconBg: '#e7e4fa', fg: '#5b52d6' };
   }
-  return { borderColor: '#d9e0ea', backgroundColor: '#f8fafc', titleColor: '#18202f' };
+  return { borderColor: '#e3e8f3', backgroundColor: '#f8fafd', titleColor: '#3c4a66', iconBg: '#edf1f8', fg: '#5c6a84' };
 }
 
 /**
@@ -225,6 +238,10 @@ export function colorForStatus(kind) {
  * @returns {string} 用户消息展示文本。
  */
 export function buildSupplementDisplayText(payload) {
+  if (payload.skip_supplement) {
+    // 跳过补充时聊天区展示一句明确声明，和后端合成给模型的输入语义保持一致。
+    return '我暂时无法补充这些信息，请基于现有信息继续分析。';
+  }
   const lines = ['我补充以下关键信息：'];
   for (const [question, answer] of Object.entries(payload.supplement_answers || {})) {
     lines.push(`- ${question}：${answer}`);

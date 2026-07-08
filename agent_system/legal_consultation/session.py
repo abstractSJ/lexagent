@@ -190,6 +190,7 @@ class LegalConsultationSession:
         *,
         on_event: Callable[[AgentEvent], None] | None = None,
         recalled_memories: list[dict[str, Any]] | None = None,
+        allow_pause: bool = True,
     ) -> tuple[str, list[AgentEvent]]:
         """
         执行一轮完整法律咨询链路。
@@ -199,6 +200,9 @@ class LegalConsultationSession:
             on_event: 可选实时事件回调。CLI 可用它在长耗时步骤开始时立即打印进度。
             recalled_memories: 可选跨会话历史记忆（白名单字段字典列表，通常由 Web 层
                 从 MemoryStore 检索后传入）。记忆只注入内部 prompt 和事件，不进入公开 history。
+            allow_pause: 是否允许本轮因阻塞性信息缺失而暂停等待补充。用户明确表示无法补充时，
+                Web 层会传 False 强制走完整链路：状态更新器的暂停判定被忽略，缺失信息只作为
+                非阻塞追问保留，最终回答基于现有信息给出阶段性意见。
 
         Returns:
             tuple[str, list[AgentEvent]]: 最终答复和过程事件。
@@ -259,25 +263,30 @@ class LegalConsultationSession:
                 record_event(events, on_event, missing_details_event)
 
             if state_update.should_pause_for_supplement:
-                supplement_message = build_supplement_prompt_message(state_update)
-                record_event(events, on_event, build_supplement_required_event(state_update, supplement_message))
-                record_event(
-                    events,
-                    on_event,
-                    build_turn_metrics_event(
-                        stages=stage_metrics,
-                        turn_started_at=turn_started_at,
-                        usage_before=usage_before,
-                        usage_source=self.usage_source,
-                        events=events,
-                    ),
-                )
-                # 暂停补充是一次成功轮次。原因是用户已经给出新事实，状态更新也已完成；
-                # 只是后续 RAG/风险/最终回答需要等用户补齐阻塞性信息后再执行。
-                self.case_state = state_update.state
-                self.public_messages.append(user_message(user_input))
-                self.public_messages.append(assistant_message(supplement_message))
-                return supplement_message, events
+                if allow_pause:
+                    supplement_message = build_supplement_prompt_message(state_update)
+                    record_event(events, on_event, build_supplement_required_event(state_update, supplement_message))
+                    record_event(
+                        events,
+                        on_event,
+                        build_turn_metrics_event(
+                            stages=stage_metrics,
+                            turn_started_at=turn_started_at,
+                            usage_before=usage_before,
+                            usage_source=self.usage_source,
+                            events=events,
+                        ),
+                    )
+                    # 暂停补充是一次成功轮次。原因是用户已经给出新事实，状态更新也已完成；
+                    # 只是后续 RAG/风险/最终回答需要等用户补齐阻塞性信息后再执行。
+                    self.case_state = state_update.state
+                    self.public_messages.append(user_message(user_input))
+                    self.public_messages.append(assistant_message(supplement_message))
+                    return supplement_message, events
+                # 用户明确表示无法补充时不能把流程卡死：忽略暂停判定继续走完整链路。
+                # 缺失问题仍保留在 state 的 follow_up_questions/evidence_gaps 里，
+                # 最终回答的“还缺哪些关键信息”章节会自然覆盖它们。
+                record_event(events, on_event, build_supplement_skipped_event(state_update))
 
             record_event(events, on_event, AgentEvent(type="legal_web_search_started", data={"status": "searching"}))
             # 公网检索的 query 素材主要来自用户输入和结构化案件状态，不强依赖 RAG 命中结果。
@@ -1505,6 +1514,27 @@ def build_supplement_required_event(state_update: LegalStateUpdate, message: str
             "evidence_gaps": (state_update.supplement_evidence_gaps or state_update.state.evidence_gaps)[:5],
             "message": message,
             "state_version": state_update.state.version,
+        },
+    )
+
+
+def build_supplement_skipped_event(state_update: LegalStateUpdate) -> AgentEvent:
+    """
+    构造“跳过补充、按现有信息继续”事件。
+
+    Args:
+        state_update: 本轮案件状态更新结果（其暂停判定被 allow_pause=False 覆盖）。
+
+    Returns:
+        AgentEvent: 提示前端本轮已忽略暂停判定继续分析；未决问题仍通过
+        legal_missing_details_suggested 事件展示，这里只携带概括状态。
+    """
+
+    return AgentEvent(
+        type="legal_supplement_skipped",
+        data={
+            "status": "continued",
+            "reason": state_update.pause_reason,
         },
     )
 

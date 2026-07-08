@@ -31,27 +31,40 @@ export default function MarkdownMessage({ text }) {
 
 const markdownComponents = {
   p: ({ children }) => (
-    <Typography component="p" sx={{ my: 1, fontSize: 14, lineHeight: 1.65 }}>
+    <Typography component="p" sx={{ my: 1, fontSize: 14, lineHeight: 1.7 }}>
       {children}
     </Typography>
   ),
   h1: ({ children }) => (
-    <Typography component="h1" variant="h6" sx={{ mt: 1.5, mb: 1, fontWeight: 900 }}>
+    <Typography component="h1" variant="h6" sx={{ mt: 1.5, mb: 1, fontWeight: 800 }}>
       {children}
     </Typography>
   ),
+  // h2 是律师口吻回答的章节标题（结论/当前关键点/法律风险等），用品牌蓝细左条强化章节切分，
+  // 让长回答的骨架在快速滚动时也能被视觉锚定。
   h2: ({ children }) => (
-    <Typography component="h2" sx={{ mt: 1.5, mb: 0.75, fontSize: 16, fontWeight: 900 }}>
+    <Typography
+      component="h2"
+      sx={{
+        mt: 2,
+        mb: 0.75,
+        pl: 1.25,
+        fontSize: 15.5,
+        fontWeight: 800,
+        lineHeight: 1.4,
+        borderLeft: '3px solid #2b4ecb',
+      }}
+    >
       {children}
     </Typography>
   ),
   h3: ({ children }) => (
-    <Typography component="h3" sx={{ mt: 1.25, mb: 0.75, fontSize: 15, fontWeight: 900 }}>
+    <Typography component="h3" sx={{ mt: 1.25, mb: 0.75, fontSize: 14.5, fontWeight: 800 }}>
       {children}
     </Typography>
   ),
   h4: ({ children }) => (
-    <Typography component="h4" sx={{ mt: 1, mb: 0.5, fontSize: 14, fontWeight: 900 }}>
+    <Typography component="h4" sx={{ mt: 1, mb: 0.5, fontSize: 14, fontWeight: 800 }}>
       {children}
     </Typography>
   ),
@@ -66,17 +79,17 @@ const markdownComponents = {
     </Box>
   ),
   li: ({ children }) => (
-    <Typography component="li" sx={{ my: 0.35, fontSize: 14, lineHeight: 1.6 }}>
+    <Typography component="li" sx={{ my: 0.4, fontSize: 14, lineHeight: 1.65 }}>
       {children}
     </Typography>
   ),
   strong: ({ children }) => (
-    <Box component="strong" sx={{ fontWeight: 900 }}>
+    <Box component="strong" sx={{ fontWeight: 800, color: '#152036' }}>
       {children}
     </Box>
   ),
   a: ({ href, children }) => (
-    <Link href={href} target="_blank" rel="noreferrer" underline="hover">
+    <Link href={href} target="_blank" rel="noreferrer" underline="hover" sx={{ fontWeight: 600 }}>
       {children}
     </Link>
   ),
@@ -89,8 +102,9 @@ const markdownComponents = {
         my: 1,
         px: 1.5,
         py: 0.75,
-        borderLeft: '3px solid #93c5fd',
-        backgroundColor: '#eff6ff',
+        borderLeft: '3px solid #a9bdf2',
+        borderRadius: '0 10px 10px 0',
+        backgroundColor: '#f2f6ff',
       }}
     >
       {children}
@@ -99,7 +113,10 @@ const markdownComponents = {
   code: ({ inline, children }) => {
     if (inline) {
       return (
-        <Box component="code" sx={{ px: 0.5, py: 0.1, borderRadius: 0.75, backgroundColor: '#e2e8f0', fontSize: 13 }}>
+        <Box
+          component="code"
+          sx={{ px: 0.5, py: 0.1, borderRadius: '6px', backgroundColor: '#edf1fa', color: '#32406b', fontSize: 13 }}
+        >
           {children}
         </Box>
       );
@@ -113,14 +130,37 @@ const markdownComponents = {
         my: 1,
         p: 1.25,
         overflowX: 'auto',
-        borderRadius: 1,
-        backgroundColor: '#0f172a',
-        color: '#e2e8f0',
+        borderRadius: '12px',
+        backgroundColor: '#101a33',
+        color: '#dfe6f5',
         fontSize: 13,
       }}
     >
       {children}
     </Box>
   ),
-  hr: () => <Box component="hr" sx={{ my: 2, border: 0, borderTop: '1px solid #d9e0ea' }} />,
+  // GFM 表格默认无边框，长表格会糊成一片；这里给最小可读样式并允许横向滚动。
+  table: ({ children }) => (
+    <Box sx={{ my: 1, overflowX: 'auto' }}>
+      <Box
+        component="table"
+        sx={{
+          width: '100%',
+          borderCollapse: 'collapse',
+          '& th, & td': {
+            border: '1px solid #e3e8f3',
+            px: 1,
+            py: 0.5,
+            fontSize: 13,
+            textAlign: 'left',
+            verticalAlign: 'top',
+          },
+          '& th': { backgroundColor: '#f4f7fd', fontWeight: 700 },
+        }}
+      >
+        {children}
+      </Box>
+    </Box>
+  ),
+  hr: () => <Box component="hr" sx={{ my: 2, border: 0, borderTop: '1px solid #e3e8f3' }} />,
 };

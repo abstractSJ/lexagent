@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef } from 'react';
-import { Alert, Box, Button, Paper, Stack, Typography } from '@mui/material';
+import { Box, Button, Paper, Stack, Typography } from '@mui/material';
 import ChatInput from './ChatInput.jsx';
 import MessageList from './MessageList.jsx';
+import PanelShell from './PanelShell.jsx';
 import SupplementDialog from './SupplementDialog.jsx';
+import { AlertTriangleIcon, ChatIcon, SparklesIcon } from '../icons.jsx';
 
 /**
  * 中间对话面板。
@@ -54,31 +56,27 @@ export default function ChatPanel({
   }, [messages, supplement]);
 
   return (
-    <Paper
-      elevation={0}
+    <PanelShell
       component="section"
-      aria-labelledby="chatTitle"
-      sx={{
-        display: 'grid',
-        gridTemplateRows: 'auto minmax(0, 1fr) auto',
-        minHeight: 0,
-        border: '1px solid',
-        borderColor: 'divider',
-        borderRadius: 2,
-        overflow: 'hidden',
-        backgroundColor: 'rgba(255, 255, 255, 0.92)',
-        boxShadow: '0 20px 50px rgba(20, 31, 54, 0.08)',
-      }}
+      titleId="chatTitle"
+      icon={<ChatIcon />}
+      accent={{ bg: '#e8edfb', fg: '#2b4ecb' }}
+      title="对话"
+      subtitle="公开聊天历史只展示用户输入和最终助手答复。"
+      footer={
+        <>
+          <ChatInput disabled={inputDisabled} isSending={isSending} onSubmit={onSubmit} />
+          <SupplementDialog
+            supplement={supplement}
+            open={supplementDialogOpen}
+            blocking={supplementBlocking}
+            disabled={supplementSubmitting}
+            onClose={onCloseSupplement}
+            onContinue={onSupplementContinue}
+          />
+        </>
+      }
     >
-      <Box sx={{ p: 2.25, borderBottom: '1px solid', borderColor: 'divider', backgroundColor: 'rgba(248, 250, 252, 0.86)' }}>
-        <Typography id="chatTitle" component="h2" variant="h6" sx={{ fontWeight: 900 }}>
-          对话
-        </Typography>
-        <Typography color="text.secondary" sx={{ mt: 0.5, fontSize: 13 }}>
-          公开聊天历史只展示用户输入和最终助手答复。
-        </Typography>
-      </Box>
-
       <Box
         ref={scrollRef}
         onScroll={handleScroll}
@@ -96,17 +94,7 @@ export default function ChatPanel({
           <SupplementCallout blocking={supplementBlocking} supplement={supplement} onOpen={onOpenSupplement} />
         )}
       </Box>
-
-      <ChatInput disabled={inputDisabled} isSending={isSending} onSubmit={onSubmit} />
-      <SupplementDialog
-        supplement={supplement}
-        open={supplementDialogOpen}
-        blocking={supplementBlocking}
-        disabled={supplementSubmitting}
-        onClose={onCloseSupplement}
-        onContinue={onSupplementContinue}
-      />
-    </Paper>
+    </PanelShell>
   );
 }
 
@@ -114,6 +102,7 @@ export default function ChatPanel({
  * 补充信息入口卡片。
  *
  * 只显示一个紧凑按钮，不把完整表单直接铺在聊天区里。这样既保留补充入口，又不会遮挡底部输入框。
+ * 阻塞性补充用琥珀色（必须处理才能继续），非阻塞建议用品牌蓝（可选优化），色彩语义与事件区一致。
  *
  * @param {object} props 组件参数。
  * @param {boolean} props.blocking 是否为阻塞性补充。
@@ -124,26 +113,62 @@ export default function ChatPanel({
 function SupplementCallout({ blocking, supplement, onOpen }) {
   const questionCount = Array.isArray(supplement.questions) ? supplement.questions.length : 0;
   const evidenceCount = Array.isArray(supplement.evidence_gaps) ? supplement.evidence_gaps.length : 0;
-  const severity = blocking ? 'warning' : 'info';
 
   return (
-    <Alert
-      severity={severity}
-      sx={{ mx: 2, mb: 1.5, alignItems: 'center' }}
-      action={
-        <Button type="button" variant="contained" size="small" onClick={onOpen} sx={{ whiteSpace: 'nowrap' }}>
-          逐条补充
-        </Button>
-      }
+    <Paper
+      elevation={0}
+      sx={{
+        mx: 2,
+        mb: 1.5,
+        p: 1.5,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 1.25,
+        // 聊天滚动容器是纵向 flex；不禁止收缩的话，消息一多此卡片会被压扁。
+        flexShrink: 0,
+        border: '1px solid',
+        borderColor: blocking ? '#f0d49a' : '#c7d7f5',
+        background: blocking
+          ? 'linear-gradient(135deg, #fff9ee 0%, #fdf3dd 100%)'
+          : 'linear-gradient(135deg, #f2f6ff 0%, #e9f0ff 100%)',
+        borderRadius: '14px',
+        animation: 'legalMsgIn 0.3s ease both',
+      }}
     >
-      <Stack spacing={0.25}>
-        <Typography sx={{ fontSize: 14, fontWeight: 900 }}>
+      <Box
+        aria-hidden="true"
+        sx={{
+          width: 34,
+          height: 34,
+          flexShrink: 0,
+          display: 'grid',
+          placeItems: 'center',
+          borderRadius: '10px',
+          backgroundColor: blocking ? '#fbead0' : '#dfe8fc',
+          color: blocking ? '#b45309' : '#2b4ecb',
+        }}
+      >
+        {blocking ? <AlertTriangleIcon sx={{ fontSize: 17 }} /> : <SparklesIcon sx={{ fontSize: 17 }} />}
+      </Box>
+      <Stack spacing={0.25} sx={{ flex: 1, minWidth: 0 }}>
+        <Typography sx={{ fontSize: 14, fontWeight: 700, color: blocking ? '#8a4c07' : '#1f3aa8' }}>
           {blocking ? '需要先补充关键信息' : '可补充关键信息'}
         </Typography>
-        <Typography sx={{ fontSize: 13 }}>
-          {supplement.message || supplement.reason || '补充后可以让后续分析更准确。'}（问题 {questionCount} 个，材料 {evidenceCount} 项）
+        <Typography sx={{ fontSize: 12.5, lineHeight: 1.5, color: 'text.secondary' }}>
+          {supplement.message || supplement.reason || '补充后可以让后续分析更准确。'}（问题 {questionCount} 个，材料{' '}
+          {evidenceCount} 项）
         </Typography>
       </Stack>
-    </Alert>
+      <Button
+        type="button"
+        variant="contained"
+        size="small"
+        color={blocking ? 'warning' : 'primary'}
+        onClick={onOpen}
+        sx={{ whiteSpace: 'nowrap', flexShrink: 0, borderRadius: '10px' }}
+      >
+        逐条补充
+      </Button>
+    </Paper>
   );
 }

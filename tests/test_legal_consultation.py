@@ -1839,6 +1839,35 @@ class LegalConsultationSessionTests(unittest.TestCase):
         self.assertEqual(["system", "user", "assistant"], [message["role"] for message in history])
         self.assertIn("事故责任认定如何", history[2]["content"])
 
+    def test_allow_pause_false_ignores_pause_and_completes_full_chain(self) -> None:
+        """
+        用户明确表示无法补充时（allow_pause=False），暂停判定应被忽略：
+        发 legal_supplement_skipped 事件后继续走完整链路，不能把流程卡死。
+        """
+
+        pause_state = json.loads(build_valid_state_update_response())
+        pause_state["should_pause_for_supplement"] = True
+        pause_state["pause_reason"] = "缺少入职时间和工资信息。"
+        pause_state["supplement_questions"] = ["入职时间是什么时候？"]
+        pause_state["supplement_evidence_gaps"] = ["工资流水"]
+        session, runner, web_search = self.build_session(
+            llm_responses=[json.dumps(pause_state, ensure_ascii=False), build_valid_case_analysis_response()],
+        )
+
+        answer, events = session.ask_with_events("我暂时无法补充更多信息，请继续分析。", allow_pause=False)
+
+        event_types = [event.type for event in events]
+        self.assertIn("阶段性答复", answer)
+        self.assertIn("legal_supplement_skipped", event_types)
+        self.assertNotIn("legal_supplement_required", event_types)
+        # 完整链路照常执行：本地 RAG、综合分析、公网检索和最终回答全部完成。
+        self.assertIn("legal_case_rag_done", event_types)
+        self.assertIn("legal_risk_analyzed", event_types)
+        self.assertIn("message_done", event_types)
+        self.assertEqual(1, len(runner.seen_calls))
+        self.assertEqual(1, len(web_search.seen_calls))
+        self.assertEqual(["system", "user", "assistant"], [m["role"] for m in session.history()])
+
     def test_web_search_failure_becomes_warning_and_final_answer_still_runs(self) -> None:
         """
         确定性公网检索失败时，应记录 warning 并继续最终回答。

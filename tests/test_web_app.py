@@ -49,6 +49,7 @@ class FakeLegalSession:
         self.pause = pause
         self.preload_calls = 0
         self.seen_inputs: list[str] = []
+        self.seen_allow_pause: list[bool] = []
         self.started = threading.Event()
         self.release = threading.Event()
         self.preload_started = threading.Event()
@@ -66,12 +67,16 @@ class FakeLegalSession:
         if self.preload_error is not None:
             raise self.preload_error
 
-    def ask_with_events(self, text, *, on_event=None):
+    def ask_with_events(self, text, *, on_event=None, allow_pause=True):
         """
         模拟一轮法律咨询，并同步推送两个过程事件。
+
+        Args:
+            allow_pause: 后端在用户明确跳过补充时传 False；记录该值供测试断言。
         """
 
         self.seen_inputs.append(text)
+        self.seen_allow_pause.append(allow_pause)
         self.started.set()
         if self.block_until_released:
             self.release.wait(timeout=5)
@@ -79,7 +84,7 @@ class FakeLegalSession:
             if self.emit_error_event_before_raise and on_event is not None:
                 on_event(AgentEvent(type="error", data={"error": str(self.error)}))
             raise self.error
-        if self.pause:
+        if self.pause and allow_pause:
             events = [
                 AgentEvent(type="case_state_updated", data={"version": 1, "summary": "缺少关键信息"}),
                 AgentEvent(
@@ -99,6 +104,14 @@ class FakeLegalSession:
                 for event in events:
                     on_event(event)
             return "请先补充入职时间和工资信息。", events
+        if self.pause and not allow_pause and on_event is not None:
+            # 与真实会话一致：暂停判定被跳过时发概括事件，随后继续正常回答链路。
+            on_event(
+                AgentEvent(
+                    type="legal_supplement_skipped",
+                    data={"status": "continued", "reason": "缺少入职时间和工资信息。"},
+                )
+            )
         if on_event is not None:
             on_event(AgentEvent(type="legal_step", data={"name": "案件状态更新", "status": "start"}))
             on_event(
@@ -406,6 +419,45 @@ class WebAppTests(unittest.TestCase):
         self.assertIn("入职时间是什么时候？：2023年5月入职", seen_input)
         self.assertIn("工资流水", seen_input)
         self.assertIn("公司上周口头辞退", seen_input)
+
+    def test_chat_skip_supplement_forces_continue_and_returns_final(self) -> None:
+        """
+        用户明确无法补充时，skip_supplement 请求应禁用暂停判定并走完整链路返回 final，
+        不能让阻塞性补充把流程卡死。
+        """
+
+        session = FakeLegalSession(pause=True)
+        client = self.build_client(session)
+
+        response = client.post("/api/chat", json={"message": "", "skip_supplement": True})
+
+        self.assertEqual(200, response.status_code)
+        items = self.parse_ndjson(response.text)
+        item_types = [item.get("type") for item in items]
+        self.assertNotIn("pause", item_types)
+        self.assertIn("final", item_types)
+        self.assertEqual("done", items[-1]["type"])
+        self.assertEqual([False], session.seen_allow_pause)
+        # 空表单也要合成一句明确的“无法补充”声明，配合状态更新 prompt 规则避免下一轮再次暂停。
+        self.assertIn("无法补充更多信息", session.seen_inputs[0])
+        event_types = [item.get("event_type") for item in items if item.get("type") == "event"]
+        self.assertIn("legal_supplement_skipped", event_types)
+        skipped = next(item for item in items if item.get("event_type") == "legal_supplement_skipped")
+        # reason 是内部判定文案，白名单只透出概括状态。
+        self.assertEqual({"status": "continued"}, skipped["data"])
+
+    def test_chat_without_skip_keeps_pause_available(self) -> None:
+        """
+        普通请求不应禁用暂停判定：allow_pause 保持默认 True。
+        """
+
+        session = FakeLegalSession(pause=True)
+        client = self.build_client(session)
+
+        response = client.post("/api/chat", json={"message": "公司没签劳动合同怎么办？"})
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual([True], session.seen_allow_pause)
 
     def test_chat_rejects_empty_message(self) -> None:
         """
@@ -755,6 +807,27 @@ class MultiSessionWebAppTests(unittest.TestCase):
             if item.get("type") == item_type:
                 return item
         return None
+
+    def test_chat_lock_released_when_session_factory_fails(self) -> None:
+        """
+        会话工厂抛出非预期异常（如缺 API key 的 RuntimeError）时必须释放 chat_lock。
+
+        否则锁永久泄漏，后续所有 /api/chat 都会收到“正在处理”的忙碌流，服务假死。
+        """
+
+        def broken_factory():
+            raise RuntimeError("缺少 API key，无法创建会话。")
+
+        app = create_app(session_factory=broken_factory, store=self.store, memory_store=self.memory_store)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        first = client.post("/api/chat", json={"message": "你好"})
+        second = client.post("/api/chat", json={"message": "你好"})
+
+        self.assertEqual(500, first.status_code)
+        # 锁已释放的证据：第二次请求同样命中工厂错误（500），而不是 200 的忙碌 NDJSON 流。
+        self.assertEqual(500, second.status_code)
+        self.assertNotIn("当前已有咨询正在处理", second.text)
 
     def test_turn_commit_writes_case_memory(self) -> None:
         """

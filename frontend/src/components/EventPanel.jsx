@@ -1,9 +1,14 @@
 import { memo, useEffect, useRef } from 'react';
-import { Box, Button, Paper, Stack, Typography } from '@mui/material';
+import { Box, Button, Stack, Typography } from '@mui/material';
 import EventCard from './EventCard.jsx';
+import PanelShell from './PanelShell.jsx';
+import { ActivityIcon } from '../icons.jsx';
 
 /**
- * 右侧执行进度面板。
+ * 左侧执行进度面板。
+ *
+ * 事件以时间线形式呈现：竖线由本组件的时间线容器统一绘制，EventCard 的节点圆压在线上。
+ * 竖线画在容器伪元素而不是每个节点内部，是为了避免节点行间距变化时出现断线。
  *
  * 使用 memo 的原因是最终回答流式期间 events 引用不变，本面板可整体跳过高频增量渲染。
  *
@@ -24,65 +29,60 @@ const EventPanel = memo(function EventPanel({ events, onClear }) {
   }, [events]);
 
   return (
-    <Paper
-      elevation={0}
+    <PanelShell
       component="aside"
-      aria-labelledby="eventTitle"
-      sx={{
-        display: 'grid',
-        gridTemplateRows: 'auto minmax(0, 1fr)',
-        minHeight: 0,
-        border: '1px solid',
-        borderColor: 'divider',
-        borderRadius: 2,
-        overflow: 'hidden',
-        backgroundColor: 'rgba(255, 255, 255, 0.92)',
-        boxShadow: '0 20px 50px rgba(20, 31, 54, 0.08)',
-      }}
-    >
-      <Stack
-        direction="row"
-        spacing={2}
-        sx={{
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          p: 2.25,
-          borderBottom: '1px solid',
-          borderColor: 'divider',
-          backgroundColor: 'rgba(248, 250, 252, 0.86)',
-        }}
-      >
-        <Box>
-          <Typography id="eventTitle" component="h2" variant="h6" sx={{ fontWeight: 900 }}>
-            执行进度
-          </Typography>
-          <Typography color="text.secondary" sx={{ mt: 0.5, fontSize: 13 }}>
-            这里展示法律咨询链路的实时事件。
-          </Typography>
-        </Box>
+      titleId="eventTitle"
+      icon={<ActivityIcon />}
+      accent={{ bg: '#f0edfd', fg: '#5b52d6' }}
+      title="执行进度"
+      subtitle="这里展示法律咨询链路的实时事件。"
+      action={
         <Button
           type="button"
           variant="text"
           size="small"
           onClick={onClear}
-          sx={{ height: 30, minHeight: 30, minWidth: 'auto', px: 1.25, alignSelf: 'flex-start' }}
+          sx={{ flexShrink: 0, minWidth: 'auto', px: 1.25 }}
         >
           清空
         </Button>
-      </Stack>
-
-      <Stack
+      }
+    >
+      <Box
         ref={scrollRef}
-        spacing={1.25}
-        sx={{ minHeight: 0, overflowY: 'auto', p: 2 }}
+        sx={{ minHeight: 0, overflowY: 'auto', px: 2, py: 1.75 }}
         aria-live="polite"
         aria-label="执行事件列表"
       >
-        {events.map((event) => (
-          <EventCard key={event.id} event={event} />
-        ))}
-      </Stack>
-    </Paper>
+        {events.length === 0 ? (
+          <Stack spacing={1} sx={{ py: 5, alignItems: 'center' }}>
+            <ActivityIcon sx={{ fontSize: 28, color: '#c3cede' }} />
+            <Typography sx={{ fontSize: 13, color: 'text.secondary' }}>暂无执行事件</Typography>
+          </Stack>
+        ) : (
+          <Box
+            sx={{
+              position: 'relative',
+              // 时间线竖线：贯穿全部节点，位置对准 EventCard 左列 32px 内居中的 28px 节点圆圆心。
+              '&::before': {
+                content: '""',
+                position: 'absolute',
+                left: '15px',
+                top: '10px',
+                bottom: '10px',
+                width: '2px',
+                backgroundColor: '#e6ebf6',
+                borderRadius: 1,
+              },
+            }}
+          >
+            {events.map((event) => (
+              <EventCard key={event.id} event={event} />
+            ))}
+          </Box>
+        )}
+      </Box>
+    </PanelShell>
   );
 });
 

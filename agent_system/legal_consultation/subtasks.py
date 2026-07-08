@@ -204,8 +204,9 @@ STATE_UPDATE_SYSTEM_PROMPT = """
 5. 必须判断是否需要先暂停后续检索和回答，要求用户补充阻塞性关键信息。
 6. 只有缺失信息会显著改变法律关系、责任基础、时效期限、程序路径、刑事/民事性质或赔偿/量刑/补偿区间时，should_pause_for_supplement 才能为 true。
 7. 如果只是有助于增强证据但不影响当前阶段性判断，不要暂停；把问题放入 state.follow_up_questions 或 state.evidence_gaps 即可。
-8. pause_reason 应简短说明为什么继续会导致不可靠分析；supplement_questions 和 supplement_evidence_gaps 只列最关键的 3-5 项。
-9. 只输出合法 JSON，不要输出 Markdown、解释文字或代码块。
+8. 用户明确表示无法补充、不知道、没有更多信息，或要求基于现有信息继续分析时，should_pause_for_supplement 必须为 false；未决问题放入 follow_up_questions / evidence_gaps，不得反复用同样的问题暂停流程。
+9. pause_reason 应简短说明为什么继续会导致不可靠分析；supplement_questions 和 supplement_evidence_gaps 只列最关键的 3-5 项。
+10. 只输出合法 JSON，不要输出 Markdown、解释文字或代码块。
 """.strip()
 
 CASE_ANALYSIS_SYSTEM_PROMPT = """
