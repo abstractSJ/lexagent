@@ -115,8 +115,8 @@ data/                  法条原始数据（向量库、会话、记忆运行时
 后端与前端测试全链路使用 fake / mock，不调用真实 LLM、BGE-M3 或 Chroma。
 
 ```bash
-python -m unittest discover     # 后端 148 个用例
-npm run test:ui                 # 前端 Vitest
+python -m unittest discover     # 后端 156 个用例
+npm run test:ui                 # 前端 Vitest 12 个用例
 ```
 
 ---
