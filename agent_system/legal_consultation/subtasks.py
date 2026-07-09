@@ -46,7 +46,14 @@ from agent_system.legal_consultation.models import (
 STRUCTURED_SUBTASK_OPTIONS = LLMCallOptions(
     temperature=0.1,
     reasoning_effort="low",
-    max_tokens=1600,
+    # 状态更新要求模型完整回显整份案件状态 JSON，输出体量随案情复杂度增长；
+    # 且 Responses API 的 max_output_tokens 把模型思考 token 也计算在内，
+    # 任何固定上限在极端满载下都可能把 JSON 拦腰截断，导致解析失败、整段降级。
+    # 这里显式不设输出上限（同时屏蔽全局 LLMConfig.max_tokens），由模型自身的
+    # 最大输出能力兜底：低温 + 低推理的结构化任务输出失控概率极小，而状态
+    # 各字段的条数上限（normalize_string_list 的 max_items）已经从源头限制了
+    # 状态本身的体量，输出天然有界。
+    disable_max_tokens=True,
 )
 
 # 多 query RAG 的第一版规模控制。
@@ -1199,25 +1206,43 @@ def legal_case_state_from_dict(
 
     source = data if isinstance(data, dict) else {}
     fallback = fallback or LegalCaseState()
+
+    def resolve_list_field(key: str, fallback_items: list[str], *, max_items: int) -> list[str]:
+        """
+        解析单个列表字段，区分“模型没写该字段”和“模型明确输出空列表”。
+
+        为什么不能写成 `normalize_string_list(...) or fallback`：空列表在 Python 里为假，
+        那种写法会把模型明确输出的 []（例如争议已澄清、矛盾已解决）误判成字段缺失，
+        导致上一轮旧值复活，状态里的条目一旦写入就永远清不掉。
+        规则：
+        - 字段缺失或值为 null：视为模型没有更新该字段，沿用上一轮旧值兜底；
+        - 值是 JSON 数组（含空数组）：完全以模型输出为准，空数组表示明确清空；
+        - 其他类型（如单个字符串）：宽松解析，解析结果为空时保守沿用旧值。
+        """
+
+        if key not in source:
+            return list(fallback_items)
+        value = source[key]
+        if value is None:
+            return list(fallback_items)
+        if isinstance(value, list):
+            return normalize_string_list(value, max_items=max_items)
+        normalized = normalize_string_list(value, max_items=max_items)
+        return normalized if normalized else list(fallback_items)
+
     return LegalCaseState(
+        # summary 是必有内容的案件摘要，为空没有业务含义，保持“为空即回退旧值”。
         summary=normalize_text(source.get("summary")) or fallback.summary,
-        parties=normalize_string_list(source.get("parties"), max_items=12) or list(fallback.parties),
-        timeline=normalize_string_list(source.get("timeline"), max_items=20) or list(fallback.timeline),
-        confirmed_facts=normalize_string_list(source.get("confirmed_facts"), max_items=30)
-        or list(fallback.confirmed_facts),
-        disputed_facts=normalize_string_list(source.get("disputed_facts"), max_items=20)
-        or list(fallback.disputed_facts),
-        adverse_facts=normalize_string_list(source.get("adverse_facts"), max_items=20)
-        or list(fallback.adverse_facts),
-        contradictions=normalize_string_list(source.get("contradictions"), max_items=20)
-        or list(fallback.contradictions),
-        evidence_gaps=normalize_string_list(source.get("evidence_gaps"), max_items=20)
-        or list(fallback.evidence_gaps),
-        user_goals=normalize_string_list(source.get("user_goals"), max_items=12) or list(fallback.user_goals),
-        legal_concepts=normalize_string_list(source.get("legal_concepts"), max_items=16)
-        or list(fallback.legal_concepts),
-        follow_up_questions=normalize_string_list(source.get("follow_up_questions"), max_items=12)
-        or list(fallback.follow_up_questions),
+        parties=resolve_list_field("parties", fallback.parties, max_items=12),
+        timeline=resolve_list_field("timeline", fallback.timeline, max_items=20),
+        confirmed_facts=resolve_list_field("confirmed_facts", fallback.confirmed_facts, max_items=30),
+        disputed_facts=resolve_list_field("disputed_facts", fallback.disputed_facts, max_items=20),
+        adverse_facts=resolve_list_field("adverse_facts", fallback.adverse_facts, max_items=20),
+        contradictions=resolve_list_field("contradictions", fallback.contradictions, max_items=20),
+        evidence_gaps=resolve_list_field("evidence_gaps", fallback.evidence_gaps, max_items=20),
+        user_goals=resolve_list_field("user_goals", fallback.user_goals, max_items=12),
+        legal_concepts=resolve_list_field("legal_concepts", fallback.legal_concepts, max_items=16),
+        follow_up_questions=resolve_list_field("follow_up_questions", fallback.follow_up_questions, max_items=12),
         version=version,
     )
 
@@ -1820,10 +1845,28 @@ def normalize_string_list(value: Any, *, max_items: int) -> list[str]:
 
 def merge_text_lists(first: list[str], second: list[str], *, limit: int) -> list[str]:
     """
-    合并两个文本列表并去重保序。
+    合并两个文本列表并去重，超出上限时优先保留靠后的新条目。
+
+    为什么不能直接 `normalize_string_list([*first, *second], max_items=limit)`：
+    那样旧条目先占满配额，列表一旦攒满，本轮新发现的条目永远挤不进状态，
+    长咨询会让案件状态“冻结”在早期内容上（只进不出的棘轮效应）。
+
+    这里的行为相当于一个滚动窗口：
+    - 重复条目以最后一次出现的位置为准（本轮再次提到的旧事实视为“刷新”，不容易被丢）；
+    - 全量去重后如超过上限，从头部丢弃最老的条目，保证新条目一定能进入。
     """
 
-    return normalize_string_list([*first, *second], max_items=limit)
+    texts = [normalize_text(item) for item in [*first, *second]]
+    # 反向遍历实现“后出现优先”的去重，再反转回正常顺序。
+    seen: set[str] = set()
+    merged_reversed: list[str] = []
+    for text in reversed(texts):
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        merged_reversed.append(text)
+    merged = list(reversed(merged_reversed))
+    return merged[len(merged) - limit:] if len(merged) > limit else merged
 
 
 def normalize_text(value: Any) -> str:

@@ -21,6 +21,7 @@ from agent_system.legal_consultation.models import (
     LegalCaseRagResult,
     LegalCaseState,
     LegalNextAction,
+    LegalRiskFinding,
     LegalWebSearchItem,
     LegalWebSearchQueryResult,
     LegalWebSearchResearchResult,
@@ -38,6 +39,9 @@ from agent_system.legal_consultation.subtasks import (
     build_deterministic_web_search_queries,
     classify_web_authority_level,
     evidence_rank_score,
+    legal_case_state_from_dict,
+    merge_state_with_analysis,
+    merge_text_lists,
     sort_evidences,
     web_search_items_from_tool_result,
 )
@@ -401,6 +405,105 @@ class LegalCaseStateUpdaterTests(unittest.TestCase):
         self.assertEqual("缺少责任比例和损失信息，无法判断赔偿范围。", update.pause_reason)
         self.assertEqual(["事故责任认定如何？", "医疗费和误工损失是多少？"], update.supplement_questions)
         self.assertEqual(["事故认定书", "医疗票据"], update.supplement_evidence_gaps)
+
+
+class CaseStateFieldMergeTests(unittest.TestCase):
+    """
+    测试案件状态字段解析与合并的“明确清空 / 缺失兜底 / 滚动窗口”语义。
+
+    这三组行为共同保证长咨询下状态不会“错的删不掉、新的进不来”。
+    """
+
+    def test_explicit_empty_list_clears_previous_value(self) -> None:
+        """
+        模型明确输出空列表时应清空旧值，不得让上一轮旧条目复活。
+        """
+
+        previous = LegalCaseState(disputed_facts=["欠款金额有争议"], version=1)
+
+        state = legal_case_state_from_dict(
+            {"summary": "双方已确认欠款金额为五万元。", "disputed_facts": []},
+            fallback=previous,
+            version=2,
+        )
+
+        self.assertEqual([], state.disputed_facts)
+
+    def test_missing_or_null_field_falls_back_to_previous_value(self) -> None:
+        """
+        字段缺失或值为 null 时视为模型没有更新该字段，应沿用上一轮旧值。
+        """
+
+        previous = LegalCaseState(
+            disputed_facts=["金额有争议"],
+            adverse_facts=["用户先动手"],
+            version=1,
+        )
+
+        state = legal_case_state_from_dict(
+            {"summary": "用户补充了新情况。", "adverse_facts": None},
+            fallback=previous,
+            version=2,
+        )
+
+        # disputed_facts 字段整体缺失，adverse_facts 值为 null，两者都应回退旧值。
+        self.assertEqual(["金额有争议"], state.disputed_facts)
+        self.assertEqual(["用户先动手"], state.adverse_facts)
+
+    def test_merge_keeps_new_items_when_list_is_full(self) -> None:
+        """
+        旧列表攒满上限后，新条目仍应能进入，被挤出的是最老的条目。
+        """
+
+        old_items = [f"旧事实{index}" for index in range(20)]
+
+        merged = merge_text_lists(old_items, ["本轮新发现"], limit=20)
+
+        self.assertEqual(20, len(merged))
+        self.assertIn("本轮新发现", merged)
+        self.assertNotIn("旧事实0", merged)
+
+    def test_merge_refreshes_duplicate_items_to_latest_position(self) -> None:
+        """
+        重复条目应按最后一次出现的位置保留：本轮再次提到的旧事实被“刷新”，不容易被挤出。
+        """
+
+        merged = merge_text_lists(
+            ["旧事实0", "旧事实1", "旧事实2"],
+            ["旧事实0", "新事实"],
+            limit=3,
+        )
+
+        # “旧事实0”本轮再次出现，应移到新位置；被挤出的是最久没被提到的“旧事实1”。
+        self.assertEqual(["旧事实2", "旧事实0", "新事实"], merged)
+
+    def test_merge_state_with_analysis_admits_new_risks_when_full(self) -> None:
+        """
+        状态列表满载时，本轮风险识别的新发现仍应合并进案件状态。
+        """
+
+        state = LegalCaseState(
+            adverse_facts=[f"历史不利事实{index}" for index in range(20)],
+            version=3,
+        )
+        risks = [
+            LegalRiskFinding(
+                type="adverse_fact",
+                severity="high",
+                fact="本轮新识别的不利事实",
+                reason="与在案证据矛盾",
+                suggestion="尽快核实",
+            )
+        ]
+
+        merged_state = merge_state_with_analysis(
+            state=state,
+            risks=risks,
+            catalog=LegalAnalysisCatalog(),
+        )
+
+        self.assertIn("本轮新识别的不利事实", merged_state.adverse_facts)
+        self.assertEqual(20, len(merged_state.adverse_facts))
 
 
 class LegalCaseRagSubtaskTests(unittest.TestCase):
